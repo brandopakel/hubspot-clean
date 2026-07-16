@@ -1,0 +1,35 @@
+hubspot:
+  object_types:
+    - contacts
+    - companies
+
+rules:
+  duplicates:
+    match_threshold: 85
+    match_fields:
+      - firstname
+      - lastname
+      - email
+
+  incomplete:
+    required_fields:
+      - email
+      - company
+      - lifecyclestage
+      - phone
+    min_completeness: 75
+
+  stale:
+    inactive_days: 90
+    activity_fields:
+      - hs_last_activity_date
+      - lastmodifieddate
+
+reports:
+  default_format: table
+  include_fields:
+    - email
+    - firstname
+    - lastname
+    - company
+    - lifecyclestage

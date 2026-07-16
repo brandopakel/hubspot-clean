@@ -1,0 +1,44 @@
+{
+  "results": [
+    {
+      "id": "1",
+      "properties": {
+        "email": "jane.doe@acme.com",
+        "firstname": "Jane",
+        "lastname": "Doe",
+        "company": "Acme Inc",
+        "phone": "555-0100",
+        "lifecyclestage": "customer",
+        "hs_last_activity_date": "2026-06-01T00:00:00Z",
+        "lastmodifieddate": "2026-06-01T00:00:00Z"
+      }
+    },
+    {
+      "id": "2",
+      "properties": {
+        "email": "j.doe@acme.com",
+        "firstname": "Jane",
+        "lastname": "Doe",
+        "company": "Acme Inc",
+        "phone": null,
+        "lifecyclestage": "lead",
+        "hs_last_activity_date": "2025-01-01T00:00:00Z",
+        "lastmodifieddate": "2025-01-01T00:00:00Z"
+      }
+    },
+    {
+      "id": "3",
+      "properties": {
+        "email": "bob@widgetco.com",
+        "firstname": "Bob",
+        "lastname": "Smith",
+        "company": null,
+        "phone": "555-0199",
+        "lifecyclestage": null,
+        "hs_last_activity_date": "2026-07-01T00:00:00Z",
+        "lastmodifieddate": "2026-07-01T00:00:00Z"
+      }
+    }
+  ],
+  "paging": null
+}
