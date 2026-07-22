@@ -8,6 +8,7 @@ something useful (contact count, maybe a Rich table/progress bar).
 
 import typer
 from rich.console import Console
+from crm_clean.client import fetch_all_contacts
 
 app = typer.Typer(help="crm-clean: audit your HubSpot CRM for data hygiene issues.")
 console = Console()
@@ -19,10 +20,13 @@ app.add_typer(audit_app, name="audit")
 @app.command()
 def fetch():
     """Fetch contacts from HubSpot and print how many were found."""
-    # TODO: call client.fetch_all_contacts() and report the count
-    # via console.print() or a Rich table/spinner while it runs.
-    raise NotImplementedError("Implement fetch() using client.fetch_all_contacts()")
-
+    try:
+        with console.status("[bold green]Fetching contacts from HubSpot...[/bold green]"):
+            contacts = fetch_all_contacts()
+    except Exception as err:
+        console.print(f"[bold red]Failed to fetch contacts:[/bold red] {err}")
+        raise typer.Exit(code=1)
+    console.print(f"[bold green]Found {len(contacts)} contacts: {contacts}[/bold green]")
 
 @audit_app.command("duplicates")
 def audit_duplicates():
