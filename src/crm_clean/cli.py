@@ -9,6 +9,7 @@ something useful (contact count, maybe a Rich table/progress bar).
 import typer
 from rich.console import Console
 from crm_clean.client import fetch_all_contacts
+from crm_clean.audits.duplicates import find_duplicates
 
 app = typer.Typer(help="crm-clean: audit your HubSpot CRM for data hygiene issues.")
 console = Console()
@@ -30,8 +31,8 @@ def fetch():
 
 @audit_app.command("duplicates")
 def audit_duplicates():
-    """Detect probable duplicate contacts (Week 2)."""
-    raise NotImplementedError
+    """Detect probable duplicate contacts."""
+
 
 
 @audit_app.command("incomplete")
