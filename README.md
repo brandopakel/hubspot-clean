@@ -39,6 +39,8 @@ other than your shell history, and CSV/JSON report export via `--format` /
 - **`--format` / `--output`** — export findings as CSV or JSON, to a file or
   straight down a pipe. Every audit carries the settings that produced it, so a
   report stays readable long after the command that made it scrolled away.
+- **`--verbose`** — every audit reports how many records it *couldn't* look at,
+  always. Pass `-v` to see which ones and why.
 - Built on [Typer](https://typer.tiangolo.com/) for the CLI and
   [Rich](https://rich.readthedocs.io/) for readable terminal output, with live
   progress bars on both the fetch and the comparison phase.
@@ -97,6 +99,8 @@ cp config.example.yaml config.yaml
 `--config path/to/other.yaml` to use a different one. Whichever file applies is
 echoed at the top of the run, so a config file can never change your results
 invisibly. Every key is optional — omit one and the built-in default applies.
+Your `config.yaml` is gitignored (`config.example.yaml` is the tracked one), so
+your own thresholds stay yours.
 
 ```yaml
 rules:
@@ -164,9 +168,9 @@ objects API has no "all properties" wildcard, so this works by listing the
 property definitions first and then passing the full set explicitly.
 
 Every audit shares the same options: `--from-file` to run offline against a JSON
-dump, `--strict` to exit 1 when anything is found (for CI), `--config` to point
-at a YAML file of defaults, `--format` / `--output` to export the findings, and
-its own tuning flags.
+dump, `--strict` to exit 1 when anything is found (for CI), `--verbose` to list
+what the audit couldn't look at, `--config` to point at a YAML file of defaults,
+`--format` / `--output` to export the findings, and its own tuning flags.
 
 ### `audit duplicates`
 
@@ -182,6 +186,7 @@ hubspot-crm-clean audit duplicates --strict               # exit 1 if anything i
 | `--threshold`, `-t` | `85` | Name similarity score (0–100) required to call two contacts a match. |
 | `--from-file` | — | Read contacts from a JSON file instead of calling HubSpot. Accepts a `{"results": [...]}` wrapper or a bare list. |
 | `--strict` | off | Exit with code 1 when duplicates are found. |
+| `--verbose`, `-v` | off | List the contacts excluded from matching, and why. |
 | `--config`, `-c` | `./config.yaml` | YAML file supplying defaults. Flags still win. |
 | `--format`, `-f` | inferred | Export as `csv` or `json`. Alone, streams to stdout. |
 | `--output`, `-o` | — | Write the report here; `-` streams to stdout. |
@@ -218,6 +223,7 @@ hubspot-crm-clean audit incomplete -r email -r phone   # only care about these t
 | `--required`, `-r` | `email`, `company`, `lifecyclestage`, `phone` | Required field. Repeat the flag for each one. |
 | `--from-file` | — | Run offline against a JSON dump. |
 | `--strict` | off | Exit 1 when anything is flagged. |
+| `--verbose`, `-v` | off | Confirm every contact was scored (this audit skips nothing). |
 | `--config`, `-c` | `./config.yaml` | YAML file supplying defaults. Flags still win. |
 | `--format`, `-f` | inferred | Export as `csv` or `json`. Alone, streams to stdout. |
 | `--output`, `-o` | — | Write the report here; `-` streams to stdout. |
@@ -246,6 +252,7 @@ hubspot-crm-clean audit stale -d 365         # only records silent for a year
 | `--activity-field` | `hs_last_activity_date`, `lastmodifieddate` | Timestamp field counted as activity. Repeat the flag for each one. |
 | `--from-file` | — | Run offline against a JSON dump. |
 | `--strict` | off | Exit 1 when anything is flagged. |
+| `--verbose`, `-v` | off | List contacts whose activity dates are unreadable. |
 | `--config`, `-c` | `./config.yaml` | YAML file supplying defaults. Flags still win. |
 | `--format`, `-f` | inferred | Export as `csv` or `json`. Alone, streams to stdout. |
 | `--output`, `-o` | — | Write the report here; `-` streams to stdout. |
@@ -271,7 +278,8 @@ hubspot-crm-clean audit all -t 92 -m 100 -d 365 # each audit still tunable
 
 Accepts every tuning flag the individual audits do (`--threshold`,
 `--min-completeness`, `--required`, `--inactive-days`, `--activity-field`) plus
-the shared `--from-file`, `--strict`, `--config`, `--format`, and `--output`.
+the shared `--from-file`, `--strict`, `--verbose`, `--config`, `--format`, and
+`--output`.
 
 The point of the command is the *single* fetch: it requests the union of every
 property the three audits read and runs all of them over that one result set.
@@ -306,6 +314,59 @@ An audit that finds nothing collapses to a single line rather than a full table,
 so a clean section stays out of the way. When `required_fields` is empty the
 incomplete section says so explicitly instead of claiming every contact is
 complete — nothing was checked, which is not the same as everything passing.
+
+## What an audit couldn't look at (`--verbose`)
+
+Both `duplicates` and `stale` skip records they can't read. The skips are
+correct — but a skipped contact is invisible in the results, and `5 scanned`
+reads as *5 compared*. So the **counts always print**, and `--verbose` names the
+contacts:
+
+```
+  2 not compared, 1 unreadable date(s).  Re-run with --verbose to list them.
+```
+
+A warning you only see once you know to ask for it isn't a warning, which is why
+the count isn't behind the flag. Only the detail is.
+
+```bash
+hubspot-crm-clean audit all -v
+```
+
+```
+Not compared  (excluded from duplicate matching)
+
+  ID   Name        Email                     Reason
+  ─────────────────────────────────────────────────────────────
+  3    Bob Smith   bob(at)widgetco.com       no usable email
+  4    -           purchasing@widgetco.com   no name
+
+Unreadable dates  (counted as no activity)
+
+  ID   Name   Email                     Field                   Value
+  ────────────────────────────────────────────────────────────────────────────
+  4    -      purchasing@widgetco.com   hs_last_activity_date   15 January 2025
+```
+
+**`duplicates`** excludes two kinds of record, both deliberately. An address that
+won't normalize can't be bucketed by domain, so it's never compared to anyone —
+and guessing at it would merge two different people. A contact with no name at
+all is skipped because two blank names score 100 against each other, which would
+manufacture duplicates. Contact 3 above is the first case, contact 4 the second.
+
+**`stale`** treats an unparseable timestamp as absent so that one malformed
+record can't abort the audit. That's the right call, but it makes a broken date
+indistinguishable from a missing one — both print as `never`. Contact 4 above is
+listed as `never` in the stale table while actually storing `15 January 2025`.
+"We have never contacted this person" and "we can't read the date we stored"
+need completely different fixes, so `-v` shows the raw value.
+
+**`incomplete`** skips nothing — every contact is scored, and a blank field is
+the finding rather than a reason to look away. `-v` says so explicitly instead
+of printing nothing and leaving you to wonder whether the flag worked.
+
+This is diagnostic output, not findings, so it stays out of the exported report
+and out of the pipe when you're streaming to stdout.
 
 ## Report export
 
@@ -443,12 +504,12 @@ pytest          # run tests
 ruff check .    # lint
 ```
 
-Everything has a test suite — 249 tests covering email normalization, domain
+Everything has a test suite — 275 tests covering email normalization, domain
 bucketing, clustering, completeness scoring, timestamp parsing, staleness
 windows, config parsing and rejection, flag-over-config precedence, report row
-shapes, format resolution, and every CLI command end to end. The CLI tests drive
-the real commands through `--from-file`, so the whole suite runs offline with no
-HubSpot credentials and no network access.
+shapes, format resolution, skip accounting, and every CLI command end to end.
+The CLI tests drive the real commands through `--from-file`, so the whole suite
+runs offline with no HubSpot credentials and no network access.
 
 Two guards worth knowing about, both in `tests/conftest.py`: every test runs in
 an empty working directory (otherwise a real `config.yaml` sitting in the repo

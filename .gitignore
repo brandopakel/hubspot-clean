@@ -6,7 +6,14 @@ venv/
 .env
 .pytest_cache/
 .ruff_cache/
+
+# Your own thresholds, not the project's. config.example.yaml is the tracked one.
+config.yaml
+
+# Exported reports. *.csv was already here; findings.json is the same thing in
+# the other format, and `audit all -o findings.json` drops it right in the root.
 *.csv
+findings*.json
 *.egg
 build/
 dist/

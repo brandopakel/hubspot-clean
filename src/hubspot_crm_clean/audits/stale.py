@@ -55,6 +55,51 @@ def last_activity(contact, activity_fields=None):
     return max(usable) if usable else None
 
 
+class Unparseable(NamedTuple):
+    """A contact carrying an activity timestamp we could not read."""
+    contact: dict
+    fields: list    # which activity fields held the unreadable values
+
+
+def _has_value(raw):
+    """True if a property carries something worth trying to parse.
+
+    Mirrors is_blank in incomplete.py: None is HubSpot's unset, "" is a field a
+    human cleared, and whitespace is what a paste leaves behind. None of the
+    three is corrupt data - they're just empty.
+    """
+    if isinstance(raw, str):
+        return bool(raw.strip())
+    return raw is not None
+
+
+def unparseable_dates(contacts, activity_fields=None):
+    """Contacts whose activity timestamps are present but unreadable.
+
+    parse_timestamp treats an unparseable value as absent so that one malformed
+    record can't abort the audit. That's the right call, but it makes a broken
+    date indistinguishable from a missing one in the results: both come out as
+    `never`. "We have never contacted this person" and "we can't read the date
+    we stored" call for completely different fixes.
+
+    Only values that are *present* count - a field that is None or empty is
+    genuinely absent, not corrupt.
+    """
+    # `is None`, not `or` - an explicit empty list means "check nothing".
+    if activity_fields is None:
+        activity_fields = DEFAULT_ACTIVITY_FIELDS
+    found = []
+    for contact in contacts:
+        props = contact["properties"]
+        bad = [
+            field for field in activity_fields
+            if _has_value(props.get(field)) and parse_timestamp(props.get(field)) is None
+        ]
+        if bad:
+            found.append(Unparseable(contact, bad))
+    return found
+
+
 def find_stale(contacts, inactive_days=DEFAULT_INACTIVE_DAYS, activity_fields=None, now=None):
     """Flag contacts with no activity in the last inactive_days. Stalest first.
 

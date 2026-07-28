@@ -7,7 +7,10 @@ import pytest
 from typer.testing import CliRunner
 
 from hubspot_crm_clean.audits.duplicates import (
+    NO_EMAIL,
+    NO_NAME,
     email_groups,
+    excluded_from_matching,
     find_duplicates,
     full_name,
     normalize_email,
@@ -253,6 +256,56 @@ def test_progress_counts_skipped_pairs_too():
 
 
 # --------------------------------------------------------------------------
+# excluded_from_matching
+# --------------------------------------------------------------------------
+
+def test_an_unparseable_email_is_reported_as_excluded():
+    # this is the skip that used to be invisible: the contact is dropped by
+    # email_groups and never appears in a cluster or a count
+    excluded = excluded_from_matching([contact("1", "not-an-email", "Jane", "Doe")])
+    assert [(item.contact["id"], item.reason) for item in excluded] == [("1", NO_EMAIL)]
+
+
+@pytest.mark.parametrize("email", [None, "", "   ", "jane@", "a@b@c.com"])
+def test_every_unbucketable_email_is_caught(email):
+    assert excluded_from_matching([contact("1", email, "Jane", "Doe")])
+
+
+def test_a_nameless_contact_is_excluded_even_with_a_good_email():
+    # two blank names score 100 against each other, so find_duplicates skips them
+    excluded = excluded_from_matching([contact("1", "ghost@acme.com")])
+    assert [item.reason for item in excluded] == [NO_NAME]
+
+
+def test_a_usable_contact_is_not_excluded():
+    assert excluded_from_matching([contact("1", "jane@acme.com", "Jane", "Doe")]) == []
+
+
+def test_one_reason_per_contact_and_email_wins():
+    # no email *and* no name: the email is the more fundamental problem, and one
+    # actionable reason beats two
+    excluded = excluded_from_matching([contact("1")])
+    assert [item.reason for item in excluded] == [NO_EMAIL]
+
+
+def test_exclusions_account_for_every_contact_find_duplicates_ignored():
+    # the invariant that makes the count trustworthy: anything not excluded and
+    # not in a cluster was genuinely compared and found unique
+    contacts = [
+        contact("1", "jane@acme.com", "Jane", "Doe"),
+        contact("2", "j.doe@acme.com", "Jane", "Doe"),
+        contact("3", "broken", "Bob", "Smith"),
+        contact("4", "ghost@acme.com"),
+        contact("5", "solo@beta.com", "Ann", "Lee"),
+    ]
+    clustered = {m["id"] for c in find_duplicates(contacts) for m in c.members}
+    excluded_ids = {item.contact["id"] for item in excluded_from_matching(contacts)}
+    assert clustered == {"1", "2"}
+    assert excluded_ids == {"3", "4"}
+    assert clustered & excluded_ids == set()        # no contact is both
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -307,3 +360,65 @@ def test_cli_accepts_a_bare_list_as_well_as_results_wrapper(tmp_path):
     result = runner.invoke(app, ["audit", "duplicates", "--from-file", str(bare)])
     assert result.exit_code == 0
     assert "1 cluster(s)" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# CLI - --verbose
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def with_skips(tmp_path):
+    """Two real duplicates plus two contacts that can never be compared."""
+    path = tmp_path / "skips.json"
+    path.write_text(json.dumps({"results": [
+        contact("1", "jane@acme.com", "Jane", "Doe"),
+        contact("2", "j.doe@acme.com", "Jane", "Doe"),
+        contact("3", "not-an-email", "Bob", "Smith"),
+        contact("4", "ghost@acme.com"),
+    ]}))
+    return path
+
+
+def test_the_skip_count_prints_without_verbose(with_skips):
+    # the point of the change: `4 scanned` used to imply 4 were compared
+    result = runner.invoke(app, ["audit", "duplicates", "--from-file", str(with_skips)])
+    assert "2 not compared" in result.stdout
+    assert "--verbose" in result.stdout          # tells you how to see which
+
+
+def test_verbose_names_the_skipped_contacts(with_skips):
+    result = runner.invoke(
+        app, ["audit", "duplicates", "--from-file", str(with_skips), "--verbose"]
+    )
+    assert "Not compared" in result.stdout
+    assert "not-an-email" in result.stdout       # the raw value, so you can see why
+    assert NO_EMAIL in result.stdout
+    assert NO_NAME in result.stdout
+    assert "Re-run with --verbose" not in result.stdout      # already did
+
+
+def test_a_clean_run_still_admits_what_it_skipped(tmp_path):
+    # no duplicates found, but one contact was never eligible - the green panel
+    # on its own would be overclaiming
+    path = tmp_path / "clean.json"
+    path.write_text(json.dumps({"results": [
+        contact("1", "solo@acme.com", "Ann", "Lee"),
+        contact("2", "broken", "Bob", "Smith"),
+    ]}))
+    result = runner.invoke(app, ["audit", "duplicates", "--from-file", str(path)])
+    assert "No duplicates found" in result.stdout
+    assert "1 not compared" in result.stdout
+
+
+def test_nothing_is_said_when_nothing_was_skipped():
+    result = runner.invoke(app, ["audit", "duplicates", "--from-file", str(FIXTURE), "-v"])
+    assert "not compared" not in result.stdout
+    assert "Not compared" not in result.stdout
+
+
+def test_verbose_output_never_reaches_a_pipe(with_skips):
+    result = runner.invoke(
+        app, ["audit", "duplicates", "--from-file", str(with_skips), "-v", "-f", "json"]
+    )
+    assert json.loads(result.stdout)["duplicates"]["findings"]      # parses cleanly
+    assert "Not compared" not in result.stdout

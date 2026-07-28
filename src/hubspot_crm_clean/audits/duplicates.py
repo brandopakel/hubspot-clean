@@ -87,6 +87,44 @@ class Cluster(NamedTuple):
     members: list   # the contact dicts themselves, so callers don't re-lookup
     confidence: float   # weakest pairwise score holding the cluster together
 
+
+# Why a contact was never compared to anything. Both are deliberate skips inside
+# find_duplicates; these constants just give them names the CLI can print.
+NO_EMAIL = "no usable email"
+NO_NAME = "no name"
+
+
+class Excluded(NamedTuple):
+    """A contact find_duplicates could not consider, and why."""
+    contact: dict
+    reason: str
+
+
+def excluded_from_matching(contacts):
+    """Contacts that could never match anything, with the reason.
+
+    find_duplicates skips two kinds of record: one whose email won't normalize
+    (email_groups can't bucket it) and one with no name at all (two blank names
+    score 100 against each other, so comparing them would invent duplicates).
+    Both skips are correct, and both are invisible in the results - a contact
+    that was never compared looks exactly like one that was compared and found
+    unique.
+
+    Reporting that is the whole point of this function. It re-derives the skips
+    rather than having find_duplicates call back, because email_groups runs twice
+    per audit (pair_count calls it too) and a callback would report each one
+    twice.
+    """
+    excluded = []
+    for contact in contacts:
+        if not normalize_email(contact["properties"].get("email")):
+            excluded.append(Excluded(contact, NO_EMAIL))
+        elif not full_name(contact):
+            # elif: an unusable email is the more fundamental exclusion, and one
+            # reason per contact is what's actionable
+            excluded.append(Excluded(contact, NO_NAME))
+    return excluded
+
 def _find(parent, contact_id):
     """Walk up to the root of this contact's group, flattening as we go."""
     while parent[contact_id] != contact_id:

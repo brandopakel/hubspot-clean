@@ -12,6 +12,7 @@ from hubspot_crm_clean.audits.stale import (
     find_stale,
     last_activity,
     parse_timestamp,
+    unparseable_dates,
 )
 from hubspot_crm_clean.cli import app
 
@@ -215,3 +216,76 @@ def test_cli_strict_exit_codes(tmp_path):
     assert runner.invoke(
         app, ["audit", "stale", "--from-file", str(clean), "--strict"]
     ).exit_code == 0
+
+
+# --------------------------------------------------------------------------
+# unparseable_dates
+# --------------------------------------------------------------------------
+
+def test_a_broken_date_is_distinguished_from_a_missing_one():
+    # both come out of find_stale as `never`; only one of them is a data problem
+    contacts = [contact("1", activity="not-a-date"), contact("2")]
+    found = unparseable_dates(contacts)
+    assert [item.contact["id"] for item in found] == ["1"]
+    assert found[0].fields == ["hs_last_activity_date"]
+    # ...and find_stale really can't tell them apart, which is why this exists
+    assert [item.days_inactive for item in find_stale(contacts, now=NOW)] == [None, None]
+
+
+@pytest.mark.parametrize("raw", [None, "", "   "])
+def test_an_absent_value_is_not_corrupt(raw):
+    assert unparseable_dates([contact("1", activity=raw)]) == []
+
+
+def test_a_readable_date_is_not_reported():
+    assert unparseable_dates([contact("1", activity=days_before(400))]) == []
+
+
+def test_every_broken_field_on_a_contact_is_named():
+    found = unparseable_dates([contact("1", activity="nope", modified="also-nope")])
+    assert found[0].fields == ["hs_last_activity_date", "lastmodifieddate"]
+
+
+def test_a_contact_with_one_good_date_still_reports_the_broken_one():
+    # last_activity happily uses the good field, so this contact is scored
+    # correctly - but the stored garbage is still worth knowing about
+    found = unparseable_dates([contact("1", activity="nope", modified=days_before(5))])
+    assert found[0].fields == ["hs_last_activity_date"]
+
+
+def test_only_the_fields_asked_for_are_checked():
+    contacts = [contact("1", activity="nope", modified="also-nope")]
+    assert unparseable_dates(contacts, ["lastmodifieddate"])[0].fields == ["lastmodifieddate"]
+    assert unparseable_dates(contacts, []) == []
+
+
+# --------------------------------------------------------------------------
+# CLI - --verbose
+# --------------------------------------------------------------------------
+
+def write_raw(tmp_path, name, results):
+    path = tmp_path / name
+    path.write_text(json.dumps({"results": results}))
+    return path
+
+
+def test_the_unreadable_count_prints_without_verbose(tmp_path):
+    path = write_raw(tmp_path, "bad.json", [contact("1", activity="15 January 2025")])
+    result = runner.invoke(app, ["audit", "stale", "--from-file", str(path)])
+    assert "1 unreadable date(s)" in result.stdout
+    assert "--verbose" in result.stdout
+
+
+def test_verbose_shows_the_field_and_the_offending_value(tmp_path):
+    path = write_raw(tmp_path, "bad.json", [contact("1", activity="15 January 2025")])
+    result = runner.invoke(app, ["audit", "stale", "--from-file", str(path), "-v"])
+    assert "Unreadable dates" in result.stdout
+    assert "hs_last_activity_date" in result.stdout
+    assert "15 January 2025" in result.stdout          # the raw value, so you can fix it
+    assert "Re-run with --verbose" not in result.stdout
+
+
+def test_nothing_is_said_when_every_date_parses(tmp_path):
+    path = write_raw(tmp_path, "ok.json", [contact("1", activity=days_before(400))])
+    result = runner.invoke(app, ["audit", "stale", "--from-file", str(path), "-v"])
+    assert "unreadable" not in result.stdout.lower()

@@ -17,6 +17,7 @@ from rich.table import Table
 
 from hubspot_crm_clean.audits.duplicates import (
     DEFAULT_THRESHOLD,
+    excluded_from_matching,
     find_duplicates,
     full_name,
     pair_count,
@@ -30,6 +31,7 @@ from hubspot_crm_clean.audits.stale import (
     DEFAULT_ACTIVITY_FIELDS,
     DEFAULT_INACTIVE_DAYS,
     find_stale,
+    unparseable_dates,
 )
 from hubspot_crm_clean.client import all_property_names, fetch_all_contacts
 from hubspot_crm_clean.config import (
@@ -73,6 +75,11 @@ FROM_FILE_OPTION = typer.Option(
 )
 STRICT_OPTION = typer.Option(
     False, "--strict", help="Exit with code 1 when findings are reported (for CI).",
+)
+VERBOSE_OPTION = typer.Option(
+    False, "--verbose", "-v",
+    help="List the records an audit could not consider, and why. "
+         "The counts are always reported; this shows which contacts they are.",
 )
 CONFIG_OPTION = typer.Option(
     None, "--config", "-c", exists=True, dir_okay=False, readable=True,
@@ -399,6 +406,77 @@ def never_seen(flagged: list) -> int:
 
 
 # --------------------------------------------------------------------------
+# What an audit could not look at
+#
+# Both audits skip records they can't read, which is correct - but a skipped
+# contact is invisible in the results, and "8 scanned" reads as "8 compared".
+# The counts below always print; --verbose names the contacts.
+# --------------------------------------------------------------------------
+
+def report_skipped(verbose: bool, *counts) -> None:
+    """Say what the audit couldn't look at, given (count, label) pairs.
+
+    Printed whether or not anything was found, and whether or not --verbose was
+    passed. A clean result that quietly excluded records is overclaiming, and a
+    warning you only see once you know to ask for it isn't a warning.
+    """
+    phrases = [f"{count} {label}" for count, label in counts if count]
+    if not phrases:
+        return
+    hint = "" if verbose else "  Re-run with --verbose to list them."
+    console.print(f"  [dim]{', '.join(phrases)}.{hint}[/dim]")
+
+
+def render_excluded(excluded: list) -> None:
+    """Print the contacts duplicate matching could never consider."""
+    table = audit_table(
+        "[bold]Not compared[/bold]  [dim](excluded from duplicate matching)[/dim]"
+    )
+    table.add_column("ID", style="dim")
+    table.add_column("Name")
+    table.add_column("Email", style="cyan")
+    table.add_column("Reason")
+
+    for item in excluded:
+        table.add_row(
+            str(item.contact["id"]),
+            full_name(item.contact) or "[dim]-[/dim]",
+            # the raw email, deliberately unnormalized - seeing the mess is the
+            # point when the reason is that we couldn't parse it
+            item.contact["properties"].get("email") or "[dim]-[/dim]",
+            f"[yellow]{item.reason}[/yellow]",
+        )
+
+    console.print(table)
+
+
+def render_unparseable(items: list) -> None:
+    """Print the contacts whose activity dates are present but unreadable."""
+    table = audit_table(
+        "[bold]Unreadable dates[/bold]  [dim](counted as no activity)[/dim]"
+    )
+    table.add_column("ID", style="dim")
+    table.add_column("Name")
+    table.add_column("Email", style="cyan")
+    table.add_column("Field")
+    table.add_column("Value")
+
+    for item in items:
+        props = item.contact["properties"]
+        for row, field in enumerate(item.fields):
+            first_row = row == 0     # label the contact once, like the cluster table
+            table.add_row(
+                str(item.contact["id"]) if first_row else "",
+                (full_name(item.contact) or "[dim]-[/dim]") if first_row else "",
+                (props.get("email") or "[dim]-[/dim]") if first_row else "",
+                field,
+                f"[yellow]{props.get(field)}[/yellow]",
+            )
+
+    console.print(table)
+
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
@@ -430,6 +508,7 @@ def audit_duplicates(
     threshold: int | None = THRESHOLD_OPTION,
     from_file: Path | None = FROM_FILE_OPTION,
     strict: bool = STRICT_OPTION,
+    verbose: bool = VERBOSE_OPTION,
     config: Path | None = CONFIG_OPTION,
     report_format: ReportFormat | None = FORMAT_OPTION,
     output: Path | None = OUTPUT_OPTION,
@@ -444,6 +523,7 @@ def audit_duplicates(
 
     contacts = resolve_contacts(from_file, IDENTITY_PROPERTIES)
     clusters = duplicates_with_progress(contacts, threshold)
+    excluded = excluded_from_matching(contacts)
 
     if not clusters:
         console.print(clean_panel(
@@ -452,12 +532,18 @@ def audit_duplicates(
         ))
     else:
         render_duplicates(clusters, threshold)
+
+    if verbose and excluded:
+        render_excluded(excluded)
+
+    if clusters:
         involved = sum(len(cluster.members) for cluster in clusters)
         console.print(summary_panel(
             f"[bold yellow]{len(clusters)}[/bold yellow] cluster(s)  [dim]|[/dim]  "
             f"[bold yellow]{involved}[/bold yellow] contacts involved  [dim]|[/dim]  "
             f"[dim]{len(contacts)} scanned[/dim]"
         ))
+    report_skipped(verbose, (len(excluded), "not compared"))
 
     # After rendering and before --strict: a clean run still owes you a report,
     # and exiting 1 must not be what decides whether the file gets written.
@@ -472,6 +558,7 @@ def audit_incomplete(
     required: list[str] | None = REQUIRED_OPTION,
     from_file: Path | None = FROM_FILE_OPTION,
     strict: bool = STRICT_OPTION,
+    verbose: bool = VERBOSE_OPTION,
     config: Path | None = CONFIG_OPTION,
     report_format: ReportFormat | None = FORMAT_OPTION,
     output: Path | None = OUTPUT_OPTION,
@@ -485,6 +572,15 @@ def audit_incomplete(
 
     contacts = resolve_contacts(from_file, unique(IDENTITY_PROPERTIES, fields))
     flagged = find_incomplete(contacts, fields, min_completeness)
+
+    if verbose:
+        # this audit skips nothing - every contact is scored, and a blank field is
+        # the finding rather than a reason to look away. Saying so beats a -v that
+        # silently prints nothing and leaves you wondering.
+        console.print(
+            f"  [dim]All {len(contacts)} contact(s) were scored; "
+            f"this audit skips nothing.[/dim]"
+        )
 
     if not flagged:
         console.print(clean_panel(
@@ -511,6 +607,7 @@ def audit_stale(
     activity_field: list[str] | None = ACTIVITY_FIELD_OPTION,
     from_file: Path | None = FROM_FILE_OPTION,
     strict: bool = STRICT_OPTION,
+    verbose: bool = VERBOSE_OPTION,
     config: Path | None = CONFIG_OPTION,
     report_format: ReportFormat | None = FORMAT_OPTION,
     output: Path | None = OUTPUT_OPTION,
@@ -524,6 +621,7 @@ def audit_stale(
 
     contacts = resolve_contacts(from_file, unique(IDENTITY_PROPERTIES, fields))
     flagged = find_stale(contacts, inactive_days=inactive_days, activity_fields=fields)
+    unreadable = unparseable_dates(contacts, fields)
 
     if not flagged:
         console.print(clean_panel(
@@ -532,12 +630,18 @@ def audit_stale(
         ))
     else:
         render_stale(flagged, inactive_days)
+
+    if verbose and unreadable:
+        render_unparseable(unreadable)
+
+    if flagged:
         never = never_seen(flagged)
         never_note = f"  [dim]|[/dim]  [dim]{never} never seen[/dim]" if never else ""
         console.print(summary_panel(
             f"[bold yellow]{len(flagged)}[/bold yellow] stale  [dim]|[/dim]  "
             f"[dim]{len(contacts)} scanned[/dim]{never_note}"
         ))
+    report_skipped(verbose, (len(unreadable), "unreadable date(s)"))
 
     export(target, len(contacts), {
         "stale": stale_section(flagged, inactive_days, fields),
@@ -555,6 +659,7 @@ def audit_all(
     activity_field: list[str] | None = ACTIVITY_FIELD_OPTION,
     from_file: Path | None = FROM_FILE_OPTION,
     strict: bool = STRICT_OPTION,
+    verbose: bool = VERBOSE_OPTION,
     config: Path | None = CONFIG_OPTION,
     report_format: ReportFormat | None = FORMAT_OPTION,
     output: Path | None = OUTPUT_OPTION,
@@ -577,10 +682,13 @@ def audit_all(
 
     console.rule("[bold cyan]Duplicates[/bold cyan]")
     clusters = duplicates_with_progress(contacts, threshold)
+    excluded = excluded_from_matching(contacts)
     if clusters:
         render_duplicates(clusters, threshold)
     else:
         console.print(f"  [green]No duplicates[/green]  [dim](threshold {threshold})[/dim]")
+    if verbose and excluded:
+        render_excluded(excluded)
 
     console.rule("[bold cyan]Incomplete[/bold cyan]")
     incomplete = find_incomplete(contacts, fields, min_completeness)
@@ -595,12 +703,15 @@ def audit_all(
 
     console.rule("[bold cyan]Stale[/bold cyan]")
     stale = find_stale(contacts, inactive_days=inactive_days, activity_fields=activity_fields)
+    unreadable = unparseable_dates(contacts, activity_fields)
     if stale:
         render_stale(stale, inactive_days)
     else:
         console.print(
             f"  [green]All contacts active[/green]  [dim](within {inactive_days} days)[/dim]"
         )
+    if verbose and unreadable:
+        render_unparseable(unreadable)
 
     console.rule("[bold]Summary[/bold]")
     found = len(clusters) + len(incomplete) + len(stale)
@@ -618,6 +729,11 @@ def audit_all(
             f"[bold yellow]{len(stale)}[/bold yellow] stale  [dim]|[/dim]  "
             f"[dim]{len(contacts)} scanned[/dim]{never_note}"
         ))
+    report_skipped(
+        verbose,
+        (len(excluded), "not compared"),
+        (len(unreadable), "unreadable date(s)"),
+    )
 
     # Insertion order is the section order in the JSON file and the order the csv
     # files are named, so it matches the order the audits ran above.
