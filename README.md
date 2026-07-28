@@ -646,6 +646,19 @@ Unlike `fix duplicates`, this one *is* allowed to run from `--from-file` even
 with the write flag — archiving the wrong record is recoverable, so the stale-id
 argument that blocks it for merging doesn't apply with the same force.
 
+#### What HubSpot does with the ids
+
+Verified against a live portal: after a merge, **HubSpot mints a brand-new
+canonical id for the survivor** — not the primary's id, and not the absorbed
+one. Both original ids keep resolving to the merged record, and
+`hs_all_contact_vids` on it lists all three.
+
+So the id in your merge report still finds the right record afterwards, but it
+is no longer that record's canonical id. If you are reconciling against another
+system, match on `hs_all_contact_vids` rather than assuming the primary id
+survived. The primary's *property values* do survive, which is the part the
+survivor rules are actually about.
+
 > **Merges cannot be undone**, from this tool or from the HubSpot UI. Archives
 > can, for 90 days. Run either against a sandbox portal first, and start with
 > `--limit`.
@@ -731,7 +744,10 @@ fails.
 These tests create throwaway contacts tagged `crmclean-livetest`, merge and
 archive them, and clean up in a fixture teardown that runs even on failure. Use
 a **sandbox** portal. They prove the one thing the offline suite structurally
-cannot: that our API call shapes are actually right.
+cannot: that the API call shapes are actually right — and they already caught
+two things mocks never would have. `hs_last_activity_date` is computed by
+HubSpot and rejected on create, and a merge assigns a new canonical id (see
+[above](#what-hubspot-does-with-the-ids)).
 
 Everything has a test suite — 345 offline tests covering email normalization, domain
 bucketing, clustering, completeness scoring, timestamp parsing, staleness

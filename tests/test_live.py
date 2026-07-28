@@ -24,6 +24,7 @@ import os
 import uuid
 
 import pytest
+from hubspot.crm.contacts.exceptions import NotFoundException
 
 from hubspot_crm_clean.audits.duplicates import find_duplicates
 from hubspot_crm_clean.audits.stale import find_stale
@@ -102,7 +103,9 @@ def test_merge_actually_merges(run_id, cleanup):
         "email": f"{TAG}-{run_id}-b@example.com",
         "firstname": "Livetest", "lastname": run_id,
     })
-    cleanup.append(primary["id"])
+    # both, not just the primary: if an assertion below fails before the merge
+    # happens, the second record would otherwise be orphaned in the portal
+    cleanup.extend([primary["id"], secondary["id"]])
 
     clusters = find_duplicates([primary, secondary])
     assert len(clusters) == 1, "the two records should look like duplicates"
@@ -114,22 +117,42 @@ def test_merge_actually_merges(run_id, cleanup):
     assert outcomes[0].failures == [], outcomes[0].failures
     assert outcomes[0].merged == [secondary["id"]]
 
-    # the survivor still resolves; the absorbed id no longer stands on its own
-    still_there = get_client().crm.contacts.basic_api.get_by_id(primary["id"])
-    assert still_there.id == primary["id"]
+    # HubSpot mints a NEW canonical id for the survivor - neither of the two we
+    # merged - while both old ids keep resolving to it. So assert on the data
+    # rather than the id, which is the part that actually matters: the primary's
+    # values are what survived.
+    api = get_client().crm.contacts.basic_api
+    survivor = api.get_by_id(
+        primary["id"], properties=["email", "company", "hs_all_contact_vids"]
+    )
+    from_absorbed = api.get_by_id(secondary["id"], properties=["email"])
+
+    assert survivor.properties["email"] == primary["properties"]["email"]
+    assert survivor.properties["company"] == "Acme", "the primary's value should win"
+    assert from_absorbed.id == survivor.id, "both ids should reach the same record"
+    vids = set(survivor.properties["hs_all_contact_vids"].split(";"))
+    assert {primary["id"], secondary["id"]} <= vids
 
 
-def test_archive_actually_archives(run_id, cleanup):
+def test_archive_actually_archives(run_id):
+    # hs_last_activity_date is computed by HubSpot and read-only on create, so an
+    # old date can't be fabricated. A brand-new contact has no activity date at
+    # all, which find_stale reports as never-seen - and never-seen is flagged,
+    # which is the branch worth proving against a real payload anyway.
     contact = create_contact({
         "email": f"{TAG}-{run_id}-stale@example.com",
         "firstname": "Livetest", "lastname": f"stale-{run_id}",
-        "hs_last_activity_date": "2015-01-01T00:00:00Z",
     })
-    # no cleanup.append: archiving IS the cleanup here
+    # no cleanup registration: archiving IS the cleanup here
 
-    flagged = find_stale([contact], inactive_days=90)
+    flagged = find_stale([contact], activity_fields=["hs_last_activity_date"])
     assert len(flagged) == 1
+    assert flagged[0].days_inactive is None, "no activity date at all"
 
     outcomes = apply_archives(plan_archives(flagged), archive_contact)
     assert outcomes[0].failure is None, outcomes[0].failure
     assert outcomes[0].archived is True
+
+    # and it really is out of the active CRM
+    with pytest.raises(NotFoundException):
+        get_client().crm.contacts.basic_api.get_by_id(contact["id"])
