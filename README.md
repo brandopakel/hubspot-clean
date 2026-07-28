@@ -2,32 +2,10 @@
 
 A Python CLI that connects to HubSpot, audits your CRM contacts for data
 hygiene issues — duplicates, incomplete records, and stale contacts — exports
-the findings as CSV or JSON, and merges the duplicates it finds.
+the findings as CSV or JSON, and cleans up what it finds.
 
-Every command reads by default. The single command that can modify your CRM
-previews its work and writes nothing until you pass `--apply`.
-
-## Status
-
-✅ **Week 1 complete** — foundation is in place: HubSpot client with pagination
-and a working `hubspot-crm-clean fetch` command.
-
-✅ **Week 2 complete** — fuzzy duplicate detection with email normalization,
-transitive clustering, and a `hubspot-crm-clean audit duplicates` command.
-
-✅ **Week 3 complete** — completeness scoring and staleness detection, with
-`hubspot-crm-clean audit incomplete` and `hubspot-crm-clean audit stale`.
-
-✅ **Week 4 complete** — a combined `hubspot-crm-clean audit all` that runs every
-audit against a single fetch, a YAML config file so thresholds live somewhere
-other than your shell history, and CSV/JSON report export via `--format` /
-`--output`.
-
-✅ **Week 5 complete** — `hubspot-crm-clean fix` actually cleans up what the
-audits find: `fix duplicates` merges them (with an `--interactive` picker),
-`fix stale` archives them. Both preview by default and write nothing until you
-say so. Plus `--save` for auto-named reports, live sandbox integration tests,
-and PyPI packaging.
+Everything reads by default. The two commands that can modify your CRM preview
+their work and write nothing until you explicitly tell them to.
 
 ## Features
 
@@ -207,7 +185,8 @@ property definitions first and then passing the full set explicitly.
 Every audit shares the same options: `--from-file` to run offline against a JSON
 dump, `--strict` to exit 1 when anything is found (for CI), `--verbose` to list
 what the audit couldn't look at, `--config` to point at a YAML file of defaults,
-`--format` / `--output` to export the findings, and its own tuning flags.
+`--format` / `--output` / `--save` to export the findings, and its own tuning
+flags.
 
 ### `audit duplicates`
 
@@ -772,7 +751,9 @@ Quick sanity check of the client in a Python REPL (from the project root, venv a
 
 ```python
 from hubspot_crm_clean.client import fetch_all_contacts
-contacts = fetch_all_contacts()
+
+# `properties` is required — HubSpot returns almost nothing without it
+contacts = fetch_all_contacts(["email", "firstname", "lastname"])
 len(contacts)      # how many contacts came back
 contacts[0]        # inspect one record's shape
 ```
@@ -828,9 +809,9 @@ though it took effect:
 | `reports.columns` | Choose which columns a report carries. |
 | `merge.*` | Configure which record survives, instead of the fixed three rules. |
 
-The natural next step is `audit incomplete`'s obvious sequel: a command that
-*fills in* missing fields from a CSV, with the same dry-run-by-default design
-`merge` uses.
+The natural next step is `audit incomplete`'s obvious sequel — a `fix
+incomplete` that *fills in* missing fields from a CSV, using the same
+dry-run-by-default design the other two `fix` commands already share.
 
 ## License
 
