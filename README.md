@@ -779,39 +779,22 @@ progress bars — which is what keeps them testable without a console.
 
 See `pyproject.toml` for the full dependency list.
 
-## Roadmap
+## Not supported yet
 
-| Week | Focus | Status |
-| ---- | ----- | ------ |
-| 1 | HubSpot client + `fetch` command | ✅ Done |
-| 2 | Duplicate detection | ✅ Done |
-| 3 | Incomplete & stale record audits | ✅ Done |
-| 4 | Combined `audit all` + YAML config + report export | ✅ Done |
-| 5 | `fix` commands, auto-named reports, packaging | ✅ Done |
+These are listed in `config.example.yaml` as comments and are **rejected by the
+config loader** rather than silently ignored — a config asking for one of them
+fails loudly instead of reading as though it took effect:
 
-All five weeks are complete. Week 5 against the original plan:
-
-| Planned | Shipped as |
-| ------- | ---------- |
-| `fix duplicates --interactive` | ✅ `fix duplicates -i` |
-| `fix stale --archive` | ✅ `fix stale --archive` |
-| Integration tests against a sandbox | ✅ `pytest -m live` |
-| Publish to PyPI | 📦 packaged and validated; upload is a manual step |
-
-Still open, and deliberately rejected by the config loader rather than silently
-ignored — a config asking for any of these fails loudly instead of reading as
-though it took effect:
-
-| Not yet | Would be |
-| ------- | -------- |
+| Key | Would let you |
+| --- | ------------- |
 | `hubspot.object_types` | Audit companies and deals, not just contacts. |
 | `rules.duplicates.match_fields` | Match on fields other than email domain + name. |
 | `reports.columns` | Choose which columns a report carries. |
 | `merge.*` | Configure which record survives, instead of the fixed three rules. |
 
-The natural next step is `audit incomplete`'s obvious sequel — a `fix
-incomplete` that *fills in* missing fields from a CSV, using the same
-dry-run-by-default design the other two `fix` commands already share.
+The obvious next command is `fix incomplete` — filling in missing fields from a
+CSV, using the same dry-run-by-default design the other two `fix` commands
+already share.
 
 ## License
 
