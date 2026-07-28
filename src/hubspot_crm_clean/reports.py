@@ -77,6 +77,7 @@ COLUMNS = {
     "stale": ["id", "name", "email", "days_inactive", "last_seen"],
     "merges": ["cluster", "confidence", "role", "id", "name", "email",
                "reason", "status", "detail"],
+    "archives": ["id", "name", "email", "days_inactive", "status", "detail"],
 }
 
 SUFFIXES = {".csv": ReportFormat.CSV, ".json": ReportFormat.JSON}
@@ -214,6 +215,36 @@ def merges_section(outcomes, threshold, applied):
         "threshold": threshold,
         "applied": applied,
         "findings": merge_rows(outcomes),
+    }
+
+
+def archive_rows(outcomes):
+    """One row per record proposed for, or taken out of, the active CRM."""
+    rows = []
+    for outcome in outcomes:
+        contact = outcome.plan.contact
+        if outcome.failure is not None:
+            status, detail = "failed", outcome.failure
+        elif outcome.archived:
+            status, detail = "archived", None
+        else:
+            status, detail = "planned", None       # dry run
+        rows.append({
+            "id": contact["id"],
+            "name": full_name(contact) or None,
+            "email": contact["properties"].get("email") or None,
+            "days_inactive": outcome.plan.days_inactive,
+            "status": status,
+            "detail": detail,
+        })
+    return rows
+
+
+def archives_section(outcomes, inactive_days, applied):
+    return {
+        "inactive_days": inactive_days,
+        "applied": applied,
+        "findings": archive_rows(outcomes),
     }
 
 

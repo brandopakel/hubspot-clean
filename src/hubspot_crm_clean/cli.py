@@ -25,6 +25,7 @@ from hubspot_crm_clean.audits.duplicates import (
 from hubspot_crm_clean.audits.incomplete import (
     DEFAULT_MIN_COMPLETENESS,
     DEFAULT_REQUIRED_FIELDS,
+    completeness_score,
     find_incomplete,
 )
 from hubspot_crm_clean.audits.stale import (
@@ -33,7 +34,12 @@ from hubspot_crm_clean.audits.stale import (
     find_stale,
     unparseable_dates,
 )
-from hubspot_crm_clean.client import all_property_names, fetch_all_contacts, merge_contacts
+from hubspot_crm_clean.client import (
+    all_property_names,
+    archive_contact,
+    fetch_all_contacts,
+    merge_contacts,
+)
 from hubspot_crm_clean.config import (
     DEFAULT_CONFIG_NAME,
     DEFAULTS,
@@ -41,16 +47,24 @@ from hubspot_crm_clean.config import (
     find_config,
     load_config,
 )
-from hubspot_crm_clean.merges import (
+from hubspot_crm_clean.fixes import (
+    UNKNOWN_DATE,
+    ArchiveOutcome,
     MergeOutcome,
+    apply_archives,
     apply_plans,
+    archive_failures,
+    created,
     failure_count,
     merge_count,
+    plan_archives,
     plan_merges,
+    repoint,
 )
 from hubspot_crm_clean.reports import (
     ReportError,
     ReportFormat,
+    archives_section,
     duplicates_section,
     incomplete_section,
     merges_section,
@@ -62,7 +76,7 @@ from hubspot_crm_clean.reports import (
 
 app = typer.Typer(
     help="hubspot-crm-clean: audit your HubSpot CRM for data hygiene issues, "
-         "and merge the duplicates it finds.",
+         "then fix them.",
     rich_markup_mode="rich",
     no_args_is_help=True,
 )
@@ -70,6 +84,13 @@ console = Console()
 
 audit_app = typer.Typer(help="Run data hygiene audits.", no_args_is_help=True)
 app.add_typer(audit_app, name="audit")
+
+fix_app = typer.Typer(
+    help="Fix what the audits find. Every command previews by default and "
+         "writes nothing until you ask it to.",
+    no_args_is_help=True,
+)
+app.add_typer(fix_app, name="fix")
 
 # Each audit declares what it reads — don't rely on whatever HubSpot defaults to.
 # Which properties an audit needs now depends on config, so the field-driven sets
@@ -141,19 +162,30 @@ SAVE_OPTION = typer.Option(
     help="Write a report to a generated filename in the current directory, "
          "e.g. hubspot-duplicates-20260727-143022.json. Defaults to json.",
 )
-# merge only. --apply is the one flag in this project that changes your CRM, so
-# it is opt-in, it is spelled out in full, and it has no short form to fat-finger.
+# `fix` only. --apply is what changes your CRM, so it is opt-in, spelled out in
+# full, and has no short form to fat-finger.
 APPLY_OPTION = typer.Option(
     False, "--apply",
     help="Actually perform the merges. Without this, nothing is written.",
 )
+# --archive is the same flag under the name the plan uses: for stale records the
+# fix *is* archiving, so `fix stale --archive` reads better than `--apply`.
+ARCHIVE_OPTION = typer.Option(
+    False, "--apply", "--archive",
+    help="Actually archive the contacts. Without this, nothing is written.",
+)
 YES_OPTION = typer.Option(
     False, "--yes", "-y", help="Skip the confirmation prompt (for scripts and CI).",
 )
+INTERACTIVE_OPTION = typer.Option(
+    False, "--interactive", "-i",
+    help="Review each cluster and choose which record survives. "
+         "Enter accepts the suggestion, s skips the cluster, q stops reviewing.",
+)
 LIMIT_OPTION = typer.Option(
     None, "--limit", "-n", min=1,
-    help="Merge at most this many clusters. Clusters are ordered by confidence, "
-         "so a limited run acts on the ones we're surest about.",
+    help="Act on at most this many records. They are ordered worst-first, so a "
+         "limited run handles the ones we're surest about.",
 )
 
 
@@ -330,11 +362,121 @@ def _preview(plan):
     return MergeOutcome(plan, merged=[], failures=[])
 
 
+def describe(contact, required_fields) -> str:
+    """One line about a record, enough to choose between two of them."""
+    when = created(contact)
+    age = "created ?" if when == UNKNOWN_DATE else f"created {when.date().isoformat()}"
+    return (
+        f"{full_name(contact) or '[dim]no name[/dim]'}  "
+        f"[cyan]{contact['properties'].get('email') or '-'}[/cyan]  "
+        f"[dim]{completeness_score(contact, required_fields):.0f}% complete  {age}[/dim]"
+    )
+
+
+def choose_interactively(plans: list, required_fields: list) -> list:
+    """Walk each cluster and let the caller pick the survivor.
+
+    Option 1 is always the rule-based suggestion, so pressing Enter through the
+    whole review reproduces exactly what the non-interactive run would do.
+
+    Skipping drops that cluster; quitting stops asking but keeps every decision
+    made so far, so abandoning a long review doesn't throw away the work.
+    """
+    chosen = []
+    for number, plan in enumerate(plans, start=1):
+        members = [plan.primary, *plan.absorbed]
+        console.print(
+            f"\n[bold]Cluster {number} of {len(plans)}[/bold]   "
+            f"[dim]confidence {plan.confidence:.0f}   {plan.domain}[/dim]"
+        )
+        for index, member in enumerate(members, start=1):
+            marker = "[green](suggested)[/green]" if index == 1 else ""
+            console.print(f"  [bold]{index}[/bold]  {describe(member, required_fields)} {marker}")
+
+        while True:
+            answer = typer.prompt(
+                f"  Keep which record? 1-{len(members)}, s(kip), q(uit)", default="1"
+            ).strip().lower()
+            if answer in {"q", "quit"}:
+                return chosen
+            if answer in {"s", "skip"}:
+                break
+            if answer.isdigit() and 1 <= int(answer) <= len(members):
+                chosen.append(repoint(plan, members[int(answer) - 1]["id"]))
+                break
+            console.print("  [yellow]Enter a record number, s to skip, or q to quit.[/yellow]")
+    return chosen
+
+
+def render_archive_plan(outcomes: list, applied: bool) -> None:
+    """Print what would be, or was, taken out of the active CRM."""
+    title = "[bold]Archive[/bold]  " + (
+        "[dim](applied)[/dim]" if applied
+        else "[bold yellow](DRY RUN - nothing written)[/bold yellow]"
+    )
+    table = audit_table(title)
+    table.add_column("Days", justify="right")
+    table.add_column("ID", style="dim")
+    table.add_column("Name")
+    table.add_column("Email", style="cyan")
+    table.add_column("Status")
+
+    for outcome in outcomes:
+        days = outcome.plan.days_inactive
+        if outcome.failure is not None:
+            status = f"[bold red]failed[/bold red] [dim]{outcome.failure}[/dim]"
+        elif outcome.archived:
+            status = "[green]archived[/green]"
+        else:
+            status = "[yellow]would archive[/yellow]"
+        table.add_row(
+            "[dim]never[/dim]" if days is None else str(days),
+            str(outcome.plan.contact["id"]),
+            full_name(outcome.plan.contact) or "[dim]-[/dim]",
+            outcome.plan.contact["properties"].get("email") or "[dim]-[/dim]",
+            status,
+        )
+
+    console.print(table)
+
+
+def archive_with_progress(plans: list) -> list:
+    """apply_archives, wrapped in a live progress bar."""
+    with Progress(
+        SpinnerColumn(style="green"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(complete_style="green", finished_style="green"),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Archiving", total=len(plans))
+        return apply_archives(
+            plans, archive_contact, on_progress=lambda amount: progress.advance(task, amount)
+        )
+
+
+def _archive_preview(plan):
+    """A plan dressed as an outcome where nothing has happened yet."""
+    return ArchiveOutcome(plan, archived=False, failure=None)
+
+
 def confirm_merge(total: int, survivors: int) -> bool:
     """Ask before writing. Merges cannot be undone from here or from HubSpot."""
     console.print(
         f"\n[bold yellow]About to merge {total} contact(s) into {survivors} "
         f"survivor(s).[/bold yellow]  [bold red]This cannot be undone.[/bold red]"
+    )
+    return typer.confirm("Continue?")
+
+
+def confirm_archive(total: int) -> bool:
+    """Ask before writing. Recoverable, unlike a merge - and the prompt says so,
+    because a warning that overstates the risk gets ignored on the one that doesn't."""
+    console.print(
+        f"\n[bold yellow]About to archive {total} contact(s).[/bold yellow]  "
+        "[dim]Restorable from HubSpot's recycle bin for 90 days.[/dim]"
     )
     return typer.confirm("Continue?")
 
@@ -875,10 +1017,14 @@ def audit_all(
         raise typer.Exit(code=1)
 
 
-@app.command()
-def merge(
+# `merge` was this command's name before the `fix` group existed. Kept as a
+# hidden alias so anything already scripted against it keeps working.
+@app.command("merge", hidden=True)
+@fix_app.command("duplicates")
+def fix_duplicates(
     threshold: int | None = THRESHOLD_OPTION,
     limit: int | None = LIMIT_OPTION,
+    interactive: bool = INTERACTIVE_OPTION,
     apply: bool = APPLY_OPTION,
     yes: bool = YES_OPTION,
     from_file: Path | None = FROM_FILE_OPTION,
@@ -898,6 +1044,17 @@ def merge(
     target = resolve_report(report_format, output, settings.default_format,
                             save=save, label="merge")
 
+    if interactive and yes:
+        raise fail(
+            "[bold red]--interactive and --yes contradict each other:[/bold red] one "
+            "asks about every cluster, the other answers everything up front."
+        )
+    if interactive and console.quiet:
+        # typer.prompt writes to stdout, which is carrying the report
+        raise fail(
+            "[bold red]--interactive can't stream to stdout:[/bold red] the prompts "
+            "and the report would share the pipe. Use --output FILE or --save."
+        )
     if apply and from_file:
         # the ids in a dump were true when it was written; the portal has moved on
         raise fail(
@@ -917,9 +1074,15 @@ def merge(
         ))
         return
 
+    if interactive:
+        plans = choose_interactively(plans, settings.required_fields)
+        if not plans:
+            console.print("[dim]No clusters selected. Nothing to do.[/dim]")
+            return
+
     total = merge_count(plans)
     dropped = len(clusters) - len(plans)
-    if dropped:
+    if dropped and not interactive:
         console.print(
             f"  [dim]--limit {limit}: acting on {len(plans)} of {len(clusters)} "
             f"cluster(s), highest confidence first.[/dim]"
@@ -954,6 +1117,83 @@ def merge(
     ))
     export(target, len(contacts), {
         "merges": merges_section(outcomes, threshold, applied=True),
+    })
+    if failures:
+        raise typer.Exit(code=1)
+
+
+@fix_app.command("stale")
+def fix_stale(
+    inactive_days: int | None = INACTIVE_DAYS_OPTION,
+    activity_field: list[str] | None = ACTIVITY_FIELD_OPTION,
+    limit: int | None = LIMIT_OPTION,
+    archive: bool = ARCHIVE_OPTION,
+    yes: bool = YES_OPTION,
+    from_file: Path | None = FROM_FILE_OPTION,
+    config: Path | None = CONFIG_OPTION,
+    report_format: ReportFormat | None = FORMAT_OPTION,
+    output: Path | None = OUTPUT_OPTION,
+    save: bool = SAVE_OPTION,
+):
+    """Archive stale contacts. Previews by default; --archive writes to HubSpot.
+
+    Unlike a merge, an archive is recoverable: the records land in HubSpot's
+    recycle bin and can be restored from the UI for 90 days.
+    """
+    console.quiet = streams_to_stdout(report_format, output, save)
+    settings = resolve_config(config)
+    inactive_days = pick(inactive_days, settings.inactive_days)
+    fields = list(activity_field) if activity_field else settings.activity_fields
+    target = resolve_report(report_format, output, settings.default_format,
+                            save=save, label="archive")
+
+    contacts = resolve_contacts(from_file, unique(IDENTITY_PROPERTIES, fields))
+    flagged = find_stale(contacts, inactive_days=inactive_days, activity_fields=fields)
+    plans = plan_archives(flagged, limit=limit)
+
+    if not plans:
+        console.print(clean_panel(
+            f"[bold green]Nothing to archive[/bold green] in {len(contacts)} contacts.",
+            f"within {inactive_days} days",
+        ))
+        return
+
+    if len(plans) < len(flagged):
+        console.print(
+            f"  [dim]--limit {limit}: acting on {len(plans)} of {len(flagged)} "
+            f"stale contact(s), longest-silent first.[/dim]"
+        )
+
+    if not archive:
+        render_archive_plan([_archive_preview(plan) for plan in plans], applied=False)
+        console.print(summary_panel(
+            f"[bold yellow]{len(plans)}[/bold yellow] contact(s) would be archived  "
+            "[dim]|[/dim]  [bold]nothing was written[/bold]  [dim]|[/dim]  "
+            "[dim]re-run with --archive to commit[/dim]"
+        ))
+        export(target, len(contacts), {
+            "archives": archives_section(
+                [_archive_preview(p) for p in plans], inactive_days, applied=False
+            ),
+        })
+        return
+
+    if not yes and not confirm_archive(len(plans)):
+        console.print("[dim]Cancelled. Nothing was written.[/dim]")
+        raise typer.Exit(code=1)
+
+    outcomes = archive_with_progress(plans)
+    render_archive_plan(outcomes, applied=True)
+
+    failures = archive_failures(outcomes)
+    archived = sum(1 for outcome in outcomes if outcome.archived)
+    console.print(summary_panel(
+        f"[bold green]{archived}[/bold green] archived  [dim]|[/dim]  "
+        + (f"[bold red]{failures}[/bold red] failed  [dim]|[/dim]  " if failures else "")
+        + f"[dim]{len(contacts)} scanned[/dim]"
+    ))
+    export(target, len(contacts), {
+        "archives": archives_section(outcomes, inactive_days, applied=True),
     })
     if failures:
         raise typer.Exit(code=1)

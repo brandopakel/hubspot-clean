@@ -8,9 +8,24 @@ version = "0.1.0"
 description = "A CLI that audits HubSpot CRM contacts for data hygiene issues and merges the duplicates it finds."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Brando Pakel" }
+]
+keywords = ["hubspot", "crm", "data-quality", "deduplication", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business",
+    "Topic :: Utilities",
 ]
 
 dependencies = [
@@ -21,6 +36,13 @@ dependencies = [
     "pyyaml>=6.0.1",
     "python-dotenv>=1.0.0",
 ]
+
+# Must come after every key of [project] above: a sub-table ends the parent
+# table, so anything below it would be parsed as part of [project.urls].
+[project.urls]
+Homepage = "https://github.com/brandopakel/hubspot-clean"
+Repository = "https://github.com/brandopakel/hubspot-clean"
+Issues = "https://github.com/brandopakel/hubspot-clean/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -38,3 +60,12 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.pytest.ini_options]
+# Live tests are deselected by default: everything else in the suite is offline,
+# and these are the only tests that write to a real portal. Opt in with
+# `pytest -m live` plus the two env vars documented in tests/test_live.py.
+addopts = "-m 'not live'"
+markers = [
+    "live: hits a real HubSpot portal and writes to it (deselected by default)",
+]

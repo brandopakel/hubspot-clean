@@ -23,9 +23,11 @@ audit against a single fetch, a YAML config file so thresholds live somewhere
 other than your shell history, and CSV/JSON report export via `--format` /
 `--output`.
 
-✅ **Week 5 complete** — `hubspot-crm-clean merge` actually cleans up the
-duplicates the audits find. It previews by default and only writes when you pass
-`--apply`. Plus `--save` for auto-named report files.
+✅ **Week 5 complete** — `hubspot-crm-clean fix` actually cleans up what the
+audits find: `fix duplicates` merges them (with an `--interactive` picker),
+`fix stale` archives them. Both preview by default and write nothing until you
+say so. Plus `--save` for auto-named reports, live sandbox integration tests,
+and PyPI packaging.
 
 ## Features
 
@@ -48,9 +50,12 @@ duplicates the audits find. It previews by default and only writes when you pass
   report stays readable long after the command that made it scrolled away.
 - **`--verbose`** — every audit reports how many records it *couldn't* look at,
   always. Pass `-v` to see which ones and why.
-- **`merge`** — folds each duplicate cluster into one surviving record. **Dry run
-  by default**: it shows you exactly what it would do and writes nothing until
-  you pass `--apply`, which then asks for confirmation.
+- **`fix duplicates`** — folds each duplicate cluster into one surviving record.
+  **Dry run by default**: it shows exactly what it would do and writes nothing
+  until you pass `--apply`, which then asks for confirmation. `--interactive`
+  walks you through each cluster so you choose the survivor yourself.
+- **`fix stale`** — archives contacts nobody has touched. Same dry-run-first
+  design; recoverable from HubSpot's recycle bin for 90 days.
 - **`--save`** — don't want to think about a filename? Get
   `hubspot-audit-20260727-143022.json` in the current directory.
 - Built on [Typer](https://typer.tiangolo.com/) for the CLI and
@@ -62,13 +67,22 @@ duplicates the audits find. It previews by default and only writes when you pass
 
 - Python **3.11+**
 - A HubSpot **private app access token**. Scopes:
-  - `crm.objects.contacts.read` — every audit, and `merge`'s dry run
-  - `crm.objects.contacts.write` — only `merge --apply`
+  - `crm.objects.contacts.read` — every audit, and every `fix` dry run
+  - `crm.objects.contacts.write` — only `fix duplicates --apply` and
+    `fix stale --archive`
 
-Nothing outside `merge --apply` can modify your CRM, so if you leave the write
-scope off, the tool is provably read-only.
+Nothing outside those two can modify your CRM, so if you leave the write scope
+off, the tool is provably read-only.
 
 ## Setup
+
+Once published, the short version is:
+
+```bash
+pip install hubspot-crm-clean
+```
+
+Until then, or to work on it:
 
 ```bash
 # clone and enter the repo
@@ -100,8 +114,8 @@ HUBSPOT_ACCESS_TOKEN=your-private-app-token-here
 To create a token: HubSpot → **Settings → Integrations → Private Apps →
 Create a private app**, grant the `crm.objects.contacts.read` scope, and copy
 the generated access token. Add `crm.objects.contacts.write` only when you're
-ready to run `merge --apply` — and try it against a HubSpot **sandbox** portal
-first, because merges cannot be undone.
+ready to run a `fix` command for real — and try it against a HubSpot **sandbox**
+portal first, because merges cannot be undone.
 
 > **Note:** `.env` is gitignored — never commit your real token.
 
@@ -176,8 +190,11 @@ hubspot-crm-clean audit duplicates      # ✅ detect probable duplicate contacts
 hubspot-crm-clean audit incomplete      # ✅ flag contacts missing required fields
 hubspot-crm-clean audit stale           # ✅ flag contacts with no recent activity
 hubspot-crm-clean audit all             # ✅ run every audit against one fetch
-hubspot-crm-clean merge                 # ✅ preview duplicate merges (writes nothing)
-hubspot-crm-clean merge --apply         # ⚠️  actually merge them
+hubspot-crm-clean fix duplicates        # ✅ preview duplicate merges (writes nothing)
+hubspot-crm-clean fix duplicates -i     # ✅ ...choosing each survivor yourself
+hubspot-crm-clean fix duplicates --apply  # ⚠️  actually merge them
+hubspot-crm-clean fix stale             # ✅ preview archiving stale contacts
+hubspot-crm-clean fix stale --archive   # ⚠️  actually archive them
 ```
 
 By default `fetch` requests a useful core set of properties. Pass
@@ -485,29 +502,76 @@ $ cat stale.csv
 id,name,email,days_inactive,last_seen
 ```
 
-## `merge` — actually cleaning up
+## `fix` — actually cleaning up
 
-Everything above this point only reads. `merge` is the one command that can
-change your CRM, so it's built so that the careless thing is the safe thing.
+Everything above this point only reads. The `fix` commands are the only ones
+that can change your CRM, so they're built so the careless thing is the safe
+thing.
 
 ```bash
-hubspot-crm-clean merge                        # preview. writes nothing.
-hubspot-crm-clean merge --limit 1              # preview just the surest cluster
-hubspot-crm-clean merge --apply                # write, after confirming
-hubspot-crm-clean merge --apply --yes          # write, no prompt (CI)
-hubspot-crm-clean merge --apply --limit 5      # write, but only five clusters
+hubspot-crm-clean fix duplicates                  # preview. writes nothing.
+hubspot-crm-clean fix duplicates --interactive    # choose each survivor yourself
+hubspot-crm-clean fix duplicates --limit 1        # preview just the surest cluster
+hubspot-crm-clean fix duplicates --apply          # write, after confirming
+hubspot-crm-clean fix duplicates --apply --yes    # write, no prompt (CI)
+
+hubspot-crm-clean fix stale                       # preview. writes nothing.
+hubspot-crm-clean fix stale --archive             # write, after confirming
 ```
+
+> `merge` still works as a hidden alias for `fix duplicates`, so anything you
+> scripted before the rename keeps running.
+
+### The safety design (both commands)
+
+**Dry run is the default, not a flag.** You opt *in* to writing. A `--dry-run`
+you can forget to pass is not a safety feature.
+
+**The preview runs the same code as the real thing.** `apply_plans()` and
+`apply_archives()` take the write as a callable; the dry run simply never calls
+it. A preview generated by different code than the thing it previews is how a
+preview ends up lying — and it's the same seam that lets every test here run
+with no API key.
+
+**They ask before writing**, unless you pass `--yes`. The two prompts say
+different things on purpose:
+
+```
+About to merge 3 contact(s) into 2 survivor(s).  This cannot be undone.
+About to archive 5 contact(s).  Restorable from HubSpot's recycle bin for 90 days.
+```
+
+Archiving really is recoverable and merging really isn't. A warning that
+overstates the risk is a warning you learn to click through — including on the
+one that doesn't overstate it.
+
+**`--limit N` exists for your first real run.** Records are already ordered
+worst-first, so `--limit 3` acts on the three we're surest about.
+
+**One failure doesn't stop the run.** Aborting halfway leaves the portal in a
+state nobody planned, so each failure is recorded against its record, the rest
+proceed, and the command exits `1` so CI still notices:
+
+```
+  3 merged | 1 failed | 2 survivor(s)
+```
+
+**Exported reports record what happened**, not just what was proposed — the
+`applied` field distinguishes the two.
+
+### `fix duplicates`
 
 | Option | Default | What it does |
 | ------ | ------- | ------------ |
 | *(none)* | — | **Dry run.** Prints the full plan and writes nothing. |
+| `--interactive`, `-i` | off | Review each cluster and pick the survivor yourself. |
 | `--apply` | off | Actually perform the merges. Prompts first. |
 | `--yes`, `-y` | off | Skip the prompt. For scripts and CI. |
-| `--limit`, `-n` | — | Act on at most this many clusters, highest confidence first. |
+| `--limit`, `-n` | — | At most this many clusters, highest confidence first. |
 | `--threshold`, `-t` | `85` | Same matching bar as `audit duplicates`. |
 | `--from-file` | — | Preview against a JSON dump. **Rejected with `--apply`.** |
-| `--config`, `-c` | `./config.yaml` | YAML defaults. `required_fields` decides "most complete". |
-| `--format` / `--output` / `--save` | — | Write a record of the plan or the outcome. |
+| `--config`, `-c` | `./config.yaml` | `required_fields` decides "most complete". |
+| `--format` / `--output` / `--save` | — | Record the plan or the outcome. |
 
 ```
 Merges  (DRY RUN - nothing written)
@@ -515,16 +579,26 @@ Merges  (DRY RUN - nothing written)
   #   Conf          ID   Name        Email                Status
   ─────────────────────────────────────────────────────────────────────
   1    100   keep   1    Jane Doe    jane.doe@acme.com    most complete
-              merge  2    Jane Doe    j.doe@acme.com       would merge
+             merge  2    Jane Doe    j.doe@acme.com       would merge
   ─────────────────────────────────────────────────────────────────────
   2    100   keep   9    Bob Smith   b.smith@beta.com     lowest id
-              merge  10   Bob Smith   bob@beta.com         would merge
+             merge  10   Bob Smith   bob@beta.com         would merge
 
   2 contact(s) would be merged into 2 survivor(s) | nothing was written |
   re-run with --apply to commit
 ```
 
-### Which record survives
+**`--apply` with `--from-file` is refused.** A dump's ids were true when it was
+written and the portal has moved on; merging on stale ids merges the wrong
+records:
+
+```
+$ hubspot-crm-clean fix duplicates --from-file dump.json --apply
+Refusing to apply from a file: --from-file is a snapshot, and merging on stale
+ids can merge the wrong records. Drop --from-file to re-run the audit live.
+```
+
+#### Which record survives
 
 HubSpot keeps the **primary's** value wherever two records disagree on a
 property, so picking the primary decides what data you lose. Three rules, in
@@ -538,49 +612,64 @@ order:
    whatever order the API happened to return.
 
 The winning rule is printed in the Status column, so you can always see *why*
-that record was chosen. Note that ids sort numerically, not as text — otherwise
-`10` would beat `9` and the tie-break would look arbitrary.
+that record was chosen. Ids sort numerically, not as text — otherwise `10` would
+beat `9` and the tie-break would look arbitrary.
 
-### The safety design
+#### `--interactive`
 
-**Dry run is the default, not a flag.** You have to opt *in* to writing. A
-`--dry-run` flag you can forget to pass is not a safety feature.
-
-**The preview runs the same code as the real thing.** `apply_plans()` takes the
-write as a callable; the dry run simply never calls it. A preview generated by
-different code than the thing it previews is how a preview ends up lying.
-
-**`--apply` with `--from-file` is refused.** A dump's ids were true when it was
-written and the portal has moved on. Merging on stale ids merges the wrong
-records:
+When you'd rather decide yourself:
 
 ```
-$ hubspot-crm-clean merge --from-file dump.json --apply
-Refusing to apply from a file: --from-file is a snapshot, and merging on stale
-ids can merge the wrong records. Drop --from-file to re-run the audit live.
+Cluster 1 of 2   confidence 100   acme.com
+  1  Jane Doe  jane.doe@acme.com  100% complete  created 2019-01-01 (suggested)
+  2  Jane Doe  j.doe@acme.com      25% complete  created 2017-01-01
+  Keep which record? 1-2, s(kip), q(uit) [1]:
 ```
 
-**It asks before writing**, unless you pass `--yes`. **`--limit` exists for your
-first real run** — clusters are already ordered by confidence, so `--limit 3`
-acts on the three we're surest about.
+**Option 1 is always the rule-based suggestion**, so holding Enter through the
+whole review reproduces exactly what the non-interactive run would have done.
+`s` skips that cluster entirely. `q` stops asking but **keeps every decision
+made so far** — abandoning a long review doesn't throw away the work.
 
-**One failure doesn't stop the run.** If merging record 2 fails and record 3
-would succeed, aborting would leave the portal in a state nobody planned. Each
-failure is recorded against its cluster, the rest proceed, and the command exits
-`1` so CI still notices:
+The reason column then records `you chose` rather than a rule name, so the
+exported report distinguishes a human override from an automatic pick.
+
+Two combinations are rejected: `--interactive --yes` (one asks about every
+cluster, the other answers everything up front) and `--interactive` while
+streaming a report to stdout (the prompts and the report would share the pipe).
+
+### `fix stale`
+
+| Option | Default | What it does |
+| ------ | ------- | ------------ |
+| *(none)* | — | **Dry run.** Prints what would be archived. |
+| `--archive` / `--apply` | off | Actually archive them. Two spellings, one flag. |
+| `--yes`, `-y` | off | Skip the prompt. |
+| `--limit`, `-n` | — | At most this many, longest-silent first. |
+| `--inactive-days`, `-d` | `90` | Same window as `audit stale`. |
+| `--activity-field` | `hs_last_activity_date`, `lastmodifieddate` | Repeatable. |
+| `--from-file` | — | Preview against a JSON dump. |
+| `--format` / `--output` / `--save` | — | Record the plan or the outcome. |
 
 ```
-  3 merged | 1 failed | 2 survivor(s)
+Archive  (DRY RUN - nothing written)
+
+   Days   ID   Name        Email               Status
+  ────────────────────────────────────────────────────────────
+    900   3    Zoe Quinn   zoe@widgetco.com    would archive
+    400   2    Bob Smith   bob@widgetco.com    would archive
+
+  2 contact(s) would be archived | nothing was written |
+  re-run with --archive to commit
 ```
 
-**Exported merge reports include the survivor**, marked `kept`, not just the
-records that were removed. A file listing only what disappeared can't tell you
-what it disappeared *into* — which is the one thing you need if a merge turns
-out to be wrong. The report's `applied` field distinguishes a proposal from a
-record of what happened.
+Unlike `fix duplicates`, this one *is* allowed to run from `--from-file` even
+with the write flag — archiving the wrong record is recoverable, so the stale-id
+argument that blocks it for merging doesn't apply with the same force.
 
-> **Merges cannot be undone**, from this tool or from the HubSpot UI. Run it
-> against a sandbox portal first, and start with `--limit`.
+> **Merges cannot be undone**, from this tool or from the HubSpot UI. Archives
+> can, for 90 days. Run either against a sandbox portal first, and start with
+> `--limit`.
 
 ## How duplicate detection works
 
@@ -637,15 +726,39 @@ python -m hubspot_crm_clean.cli fetch
 ## Development
 
 ```bash
-pytest          # run tests
-ruff check .    # lint
+pytest              # run the offline suite
+ruff check .        # lint
+pytest -m live      # integration tests against a real portal (see below)
 ```
 
-Everything has a test suite — 323 tests covering email normalization, domain
+### Integration tests
+
+`tests/test_live.py` is the only place that talks to a real portal, and the only
+place that writes. It is **deselected by default** (`addopts = "-m 'not live'"`),
+so `pytest` and CI stay offline. To run it:
+
+```bash
+export HUBSPOT_ACCESS_TOKEN=...     # needs contacts read AND write
+export HUBSPOT_LIVE_TESTS=1
+pytest -m live
+```
+
+Two switches on purpose. A token alone isn't enough, because you already have
+one sitting in `.env` for ordinary use — so a stray `pytest -m live` would
+otherwise start writing to whatever portal it points at. `HUBSPOT_LIVE_TESTS` is
+the one you have to set deliberately. Without both, the module skips rather than
+fails.
+
+These tests create throwaway contacts tagged `crmclean-livetest`, merge and
+archive them, and clean up in a fixture teardown that runs even on failure. Use
+a **sandbox** portal. They prove the one thing the offline suite structurally
+cannot: that our API call shapes are actually right.
+
+Everything has a test suite — 345 offline tests covering email normalization, domain
 bucketing, clustering, completeness scoring, timestamp parsing, staleness
 windows, config parsing and rejection, flag-over-config precedence, report row
-shapes, format resolution, skip accounting, merge planning and partial merge
-failures, and every CLI command end to end.
+shapes, format resolution, skip accounting, merge and archive planning, partial
+write failures, the interactive picker, and every CLI command end to end.
 The CLI tests drive the real commands through `--from-file`, so the whole suite
 runs offline with no HubSpot credentials and no network access.
 
@@ -668,11 +781,11 @@ contacts[0]        # inspect one record's shape
 
 ```
 src/hubspot_crm_clean/
-├── cli.py            # Typer entrypoint — registers `fetch` and `audit` commands
+├── cli.py            # Typer entrypoint — `fetch`, `audit *`, `fix *`
 ├── client.py         # HubSpot client: auth, pagination, normalization
 ├── config.py         # ✅ YAML config loading + strict validation
 ├── reports.py        # ✅ CSV/JSON export + destination resolution
-├── merges.py         # ✅ merge planning + execution (the only writes)
+├── fixes.py          # ✅ merge + archive planning and execution (the only writes)
 └── audits/
     ├── duplicates.py # ✅ fuzzy matching + clustering
     ├── incomplete.py # ✅ completeness scoring
@@ -693,10 +806,16 @@ See `pyproject.toml` for the full dependency list.
 | 2 | Duplicate detection | ✅ Done |
 | 3 | Incomplete & stale record audits | ✅ Done |
 | 4 | Combined `audit all` + YAML config + report export | ✅ Done |
-| 5 | `merge` command + auto-named reports | ✅ Done |
+| 5 | `fix` commands, auto-named reports, packaging | ✅ Done |
 
-All five weeks are complete: the tool now finds the problems *and* fixes the one
-class of problem that can be fixed automatically.
+All five weeks are complete. Week 5 against the original plan:
+
+| Planned | Shipped as |
+| ------- | ---------- |
+| `fix duplicates --interactive` | ✅ `fix duplicates -i` |
+| `fix stale --archive` | ✅ `fix stale --archive` |
+| Integration tests against a sandbox | ✅ `pytest -m live` |
+| Publish to PyPI | 📦 packaged and validated; upload is a manual step |
 
 Still open, and deliberately rejected by the config loader rather than silently
 ignored — a config asking for any of these fails loudly instead of reading as

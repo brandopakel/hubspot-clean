@@ -63,6 +63,17 @@ def merge_contacts(primary_id, merge_id) -> None:
     )
 
 
+def archive_contact(contact_id) -> None:
+    '''Archive a contact. THIS WRITES TO YOUR CRM.
+
+    The record leaves the active CRM and lands in HubSpot's recycle bin, where it
+    stays restorable from the UI for 90 days - unlike a merge, which is permanent.
+    Requires the crm.objects.contacts.write scope.
+    '''
+    ct = get_client()
+    ct.crm.contacts.basic_api.archive(str(contact_id))
+
+
 def normalize_contacts(contacts: list) -> list[dict]:
     '''Normalize contacts into a list of dicts.'''
     normalized_contacts = [contact.to_dict() for contact in contacts]

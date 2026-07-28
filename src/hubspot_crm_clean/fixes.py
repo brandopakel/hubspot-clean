@@ -1,16 +1,16 @@
 """
-Merge planning and execution.
+Fix planning and execution: merging duplicates, archiving stale records.
 
-Planning is pure: it takes the clusters find_duplicates already produced and
-decides, for each one, which record should survive. Nothing in here talks to
-HubSpot - apply_plans() takes the write as a callable, which is what lets the
-whole module be tested without an API key and, more importantly, what lets the
-dry run and the real run share one code path. A preview that runs different code
-from the thing it previews is not a preview.
+Planning is pure. It takes what the audits already found and decides what should
+happen to each record. Nothing in here talks to HubSpot - the apply_* functions
+take the write as a callable, which is what lets the whole module be tested
+without an API key and, more importantly, what lets the dry run and the real run
+share one code path. A preview that runs different code from the thing it
+previews is not a preview.
 
 This is the only part of the project that can change your CRM, so the defaults
 are arranged so that doing nothing is safe: planning is free, and the caller has
-to hand over a working merge_fn before a single record moves.
+to hand over a working write function before a single record moves.
 """
 
 from datetime import UTC, datetime
@@ -28,6 +28,7 @@ UNKNOWN_DATE = datetime.max.replace(tzinfo=UTC)
 MOST_COMPLETE = "most complete"
 OLDEST = "oldest"
 LOWEST_ID = "lowest id"
+CHOSEN = "you chose"        # --interactive overrode the rules
 
 
 class MergePlan(NamedTuple):
@@ -135,3 +136,73 @@ def apply_plans(plans, merge_fn, on_progress=None):
 def failure_count(outcomes):
     """How many individual merges failed."""
     return sum(len(outcome.failures) for outcome in outcomes)
+
+
+def repoint(plan, primary_id):
+    """Rebuild a plan around a different survivor.
+
+    What --interactive does once you pick a record: the cluster is unchanged, but
+    a different member keeps its values and the rest are folded into it instead.
+    The reason becomes CHOSEN, so the report records that a human overrode the
+    rules rather than that the rules produced this.
+    """
+    members = [plan.primary, *plan.absorbed]
+    primary = next(m for m in members if m["id"] == primary_id)
+    absorbed = [m for m in members if m["id"] != primary_id]
+    return plan._replace(primary=primary, absorbed=absorbed, reason=CHOSEN)
+
+
+# --------------------------------------------------------------------------
+# Archiving stale records
+#
+# Simpler than merging: there's no survivor to choose, just a list of records to
+# take out of the active CRM. Unlike a merge, an archive is recoverable from
+# HubSpot's recycle bin for 90 days - which is why this one is allowed to run
+# from a --from-file snapshot and merging is not.
+# --------------------------------------------------------------------------
+
+class ArchivePlan(NamedTuple):
+    """One record proposed for archiving."""
+    contact: dict
+    days_inactive: object   # int, or None for a record we have never heard from
+
+
+class ArchiveOutcome(NamedTuple):
+    """What actually happened to one archive plan."""
+    plan: ArchivePlan
+    archived: bool
+    failure: object         # str, or None
+
+
+def plan_archives(flagged, limit=None):
+    """Turn find_stale results into archive plans, stalest first.
+
+    `limit` truncates rather than filters, and find_stale already sorts by how
+    long a record has been silent - so a limited run archives the deadest
+    records rather than an arbitrary slice.
+    """
+    plans = [ArchivePlan(item.contact, item.days_inactive) for item in flagged]
+    return plans[:limit] if limit is not None else plans
+
+
+def apply_archives(plans, archive_fn, on_progress=None):
+    """Execute the plans, returning what happened to each.
+
+    Same contract as apply_plans: a failure is recorded, the run continues, and
+    nothing is raised - the caller owns the exit code.
+    """
+    outcomes = []
+    for plan in plans:
+        try:
+            archive_fn(plan.contact["id"])
+            outcomes.append(ArchiveOutcome(plan, archived=True, failure=None))
+        except Exception as err:      # noqa: BLE001 - one bad record must not end the run
+            outcomes.append(ArchiveOutcome(plan, archived=False, failure=str(err)))
+        if on_progress:
+            on_progress(1)
+    return outcomes
+
+
+def archive_failures(outcomes):
+    """How many archives failed."""
+    return sum(1 for outcome in outcomes if outcome.failure is not None)
