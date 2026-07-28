@@ -1,35 +1,53 @@
-hubspot:
-  object_types:
-    - contacts
-    - companies
+# Copy to config.yaml to change the audit defaults without retyping flags.
+#
+#   cp config.example.yaml config.yaml
+#
+# A config file only supplies defaults: any flag you pass on the command line
+# still wins. Every key is optional — omit one and the built-in default applies.
+# Unknown keys are rejected rather than ignored, so a typo fails loudly instead
+# of silently doing nothing.
 
 rules:
   duplicates:
+    # Name similarity score (0-100) required to call two contacts a match.
     match_threshold: 85
-    match_fields:
-      - firstname
-      - lastname
-      - email
 
   incomplete:
+    # A contact is scored on how many of these it actually fills in.
     required_fields:
       - email
       - company
       - lifecyclestage
       - phone
+    # Flag contacts scoring below this percentage. Landing exactly on it passes.
     min_completeness: 75
 
   stale:
+    # Flag contacts with no activity in at least this many days.
     inactive_days: 90
+    # The most recent timestamp across these fields counts as "last seen".
     activity_fields:
       - hs_last_activity_date
       - lastmodifieddate
 
+# Report export. Note that nothing here decides *whether* a report is written —
+# only --format/--output do. This just says which format to use when the command
+# line leaves it open.
 reports:
-  default_format: table
-  include_fields:
-    - email
-    - firstname
-    - lastname
-    - company
-    - lifecyclestage
+  # Unlike every key above, this one has no built-in default, so it ships
+  # commented out: uncommenting it is a real change rather than a restatement.
+  # Leave it unset and --format is required whenever the destination has no
+  # .csv or .json extension to infer from.
+  #
+  # default_format: JSON
+  #
+  # Format precedence is: --format flag → --output's extension → this key.
+
+# Not configurable yet — listed here so the intent is on record, but left
+# commented out because the loader rejects keys it cannot honor:
+#
+#   hubspot.object_types   companies and other objects; only contacts are audited today
+#   rules.duplicates.match_fields
+#                          duplicate matching is fixed at email-domain bucketing
+#                          plus fuzzy first/last name comparison
+#   reports.columns        which columns each report carries is fixed today

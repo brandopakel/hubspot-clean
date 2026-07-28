@@ -15,8 +15,10 @@ transitive clustering, and a `hubspot-crm-clean audit duplicates` command.
 ✅ **Week 3 complete** — completeness scoring and staleness detection, with
 `hubspot-crm-clean audit incomplete` and `hubspot-crm-clean audit stale`.
 
-🚧 Combined `audit all` and report export land in Week 4. See the
-[Roadmap](#roadmap) below.
+✅ **Week 4 complete** — a combined `hubspot-crm-clean audit all` that runs every
+audit against a single fetch, a YAML config file so thresholds live somewhere
+other than your shell history, and CSV/JSON report export via `--format` /
+`--output`.
 
 ## Features
 
@@ -28,6 +30,15 @@ transitive clustering, and a `hubspot-crm-clean audit duplicates` command.
   actually fills in, and flags the ones below a threshold.
 - **`audit stale`** — flags contacts with no activity in a configurable window,
   separating "silent for N days" from "never heard from at all".
+- **`audit all`** — runs all three against a *single* fetch, section by section,
+  then one combined summary. Running the commands separately pages through the
+  whole portal three times.
+- **`config.yaml`** — set your thresholds and required fields once instead of
+  retyping flags. Command-line flags still win, and an unrecognized key is a
+  loud error rather than a silent no-op.
+- **`--format` / `--output`** — export findings as CSV or JSON, to a file or
+  straight down a pipe. Every audit carries the settings that produced it, so a
+  report stays readable long after the command that made it scrolled away.
 - Built on [Typer](https://typer.tiangolo.com/) for the CLI and
   [Rich](https://rich.readthedocs.io/) for readable terminal output, with live
   progress bars on both the fetch and the comparison phase.
@@ -74,6 +85,64 @@ the generated access token.
 
 > **Note:** `.env` is gitignored — never commit your real token.
 
+### Audit defaults (`config.yaml`)
+
+Thresholds and field lists can live in a YAML file instead of your shell history:
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+`config.yaml` is picked up automatically from the directory you run in; pass
+`--config path/to/other.yaml` to use a different one. Whichever file applies is
+echoed at the top of the run, so a config file can never change your results
+invisibly. Every key is optional — omit one and the built-in default applies.
+
+```yaml
+rules:
+  duplicates:
+    match_threshold: 85
+  incomplete:
+    required_fields: [email, company, lifecyclestage, phone]
+    min_completeness: 75
+  stale:
+    inactive_days: 90
+    activity_fields: [hs_last_activity_date, lastmodifieddate]
+
+reports:
+  default_format: json      # only consulted when --output can't imply one
+```
+
+Precedence is **command-line flag → config file → built-in default**, so a flag
+always wins over the file for that one run.
+
+Validation is deliberately strict: an unknown key is an error, not a silent
+no-op. A config that quietly ignored `min_completness: 90` would be worse than
+no config at all, because it reads as though it took effect.
+
+```
+$ hubspot-crm-clean audit incomplete --config bad.yaml
+Bad config: bad.yaml: unknown key(s) under rules.incomplete: min_completness.
+Valid keys: min_completeness, required_fields
+```
+
+Wrong types, out-of-range numbers, and a field list that repeats a name are
+rejected the same way — the last of those because completeness scores divide by
+the length of `required_fields`, so a duplicate would silently skew every score.
+Errors name the dotted path to the offending key.
+
+`reports.default_format` is the one key with no built-in default, so it ships
+commented out in the example rather than restated: leaving it unset is a real
+setting, and it means `--format` is required whenever `--output` has no `.csv`
+or `.json` extension to infer from. Note that it never decides *whether* a
+report is written — only `--format` / `--output` do that, so a configured
+directory doesn't quietly start dropping files on every run.
+
+`config.example.yaml` also lists, in comments, the settings that are *not*
+configurable yet (`hubspot.object_types`, `rules.duplicates.match_fields`,
+`reports.columns`) — they're commented out precisely because the loader refuses
+keys it can't honour.
+
 ## Usage
 
 Run commands from the project root with the virtual environment active.
@@ -84,6 +153,7 @@ hubspot-crm-clean fetch --all-properties  # ✅ ...including every custom proper
 hubspot-crm-clean audit duplicates      # ✅ detect probable duplicate contacts
 hubspot-crm-clean audit incomplete      # ✅ flag contacts missing required fields
 hubspot-crm-clean audit stale           # ✅ flag contacts with no recent activity
+hubspot-crm-clean audit all             # ✅ run every audit against one fetch
 ```
 
 By default `fetch` requests a useful core set of properties. Pass
@@ -93,15 +163,10 @@ your portal actually stores, but noticeably slower and much larger. The HubSpot
 objects API has no "all properties" wildcard, so this works by listing the
 property definitions first and then passing the full set explicitly.
 
-Planned (Week 4):
-
-```bash
-hubspot-crm-clean audit all             # 🚧 run every audit at once
-```
-
-Every audit shares the same three options: `--from-file` to run offline against
-a JSON dump, `--strict` to exit 1 when anything is found (for CI), and its own
-tuning flag.
+Every audit shares the same options: `--from-file` to run offline against a JSON
+dump, `--strict` to exit 1 when anything is found (for CI), `--config` to point
+at a YAML file of defaults, `--format` / `--output` to export the findings, and
+its own tuning flags.
 
 ### `audit duplicates`
 
@@ -117,6 +182,9 @@ hubspot-crm-clean audit duplicates --strict               # exit 1 if anything i
 | `--threshold`, `-t` | `85` | Name similarity score (0–100) required to call two contacts a match. |
 | `--from-file` | — | Read contacts from a JSON file instead of calling HubSpot. Accepts a `{"results": [...]}` wrapper or a bare list. |
 | `--strict` | off | Exit with code 1 when duplicates are found. |
+| `--config`, `-c` | `./config.yaml` | YAML file supplying defaults. Flags still win. |
+| `--format`, `-f` | inferred | Export as `csv` or `json`. Alone, streams to stdout. |
+| `--output`, `-o` | — | Write the report here; `-` streams to stdout. |
 
 Output groups each set of probable duplicates into a numbered cluster, with a
 confidence score colour-coded by how much to trust it:
@@ -150,6 +218,9 @@ hubspot-crm-clean audit incomplete -r email -r phone   # only care about these t
 | `--required`, `-r` | `email`, `company`, `lifecyclestage`, `phone` | Required field. Repeat the flag for each one. |
 | `--from-file` | — | Run offline against a JSON dump. |
 | `--strict` | off | Exit 1 when anything is flagged. |
+| `--config`, `-c` | `./config.yaml` | YAML file supplying defaults. Flags still win. |
+| `--format`, `-f` | inferred | Export as `csv` or `json`. Alone, streams to stdout. |
+| `--output`, `-o` | — | Write the report here; `-` streams to stdout. |
 
 ```
 Incomplete contacts  (below 75%)
@@ -172,8 +243,12 @@ hubspot-crm-clean audit stale -d 365         # only records silent for a year
 | Option | Default | What it does |
 | ------ | ------- | ------------ |
 | `--inactive-days`, `-d` | `90` | Flag contacts with no activity in at least this many days. |
+| `--activity-field` | `hs_last_activity_date`, `lastmodifieddate` | Timestamp field counted as activity. Repeat the flag for each one. |
 | `--from-file` | — | Run offline against a JSON dump. |
 | `--strict` | off | Exit 1 when anything is flagged. |
+| `--config`, `-c` | `./config.yaml` | YAML file supplying defaults. Flags still win. |
+| `--format`, `-f` | inferred | Export as `csv` or `json`. Alone, streams to stdout. |
+| `--output`, `-o` | — | Write the report here; `-` streams to stdout. |
 
 ```
 Stale contacts  (no activity in 90+ days)
@@ -184,6 +259,129 @@ Stale contacts  (no activity in 90+ days)
     570   2    Bob Smith   bob@widgetco.com   2025-01-01
 
   2 stale | 4 scanned | 1 never seen
+```
+
+### `audit all`
+
+```bash
+hubspot-crm-clean audit all                     # all three audits, one fetch
+hubspot-crm-clean audit all --strict            # exit 1 if any audit finds anything
+hubspot-crm-clean audit all -t 92 -m 100 -d 365 # each audit still tunable
+```
+
+Accepts every tuning flag the individual audits do (`--threshold`,
+`--min-completeness`, `--required`, `--inactive-days`, `--activity-field`) plus
+the shared `--from-file`, `--strict`, `--config`, `--format`, and `--output`.
+
+The point of the command is the *single* fetch: it requests the union of every
+property the three audits read and runs all of them over that one result set.
+Running the three commands separately pages through your entire portal three
+times. `--strict` exits 1 if *any* audit reports a finding.
+
+```
+──────────────────── Duplicates ────────────────────
+Probable duplicates  (threshold 85)
+
+  #   Conf   ID   Name       Email
+  1    100   1    Jane Doe   jane.doe@acme.com
+              2    Jane Doe   j.doe@acme.com
+
+──────────────────── Incomplete ────────────────────
+Incomplete contacts  (below 75%)
+
+  Score   ID   Name        Email              Missing
+    50%   3    Bob Smith   bob@widgetco.com   company, lifecyclestage
+
+─────────────────────── Stale ──────────────────────
+Stale contacts  (no activity in 90+ days)
+
+   Days   ID   Name       Email            Last activity
+    572   2    Jane Doe   j.doe@acme.com   2025-01-01
+
+────────────────────── Summary ─────────────────────
+  1 duplicate cluster(s) | 1 incomplete | 1 stale | 3 scanned
+```
+
+An audit that finds nothing collapses to a single line rather than a full table,
+so a clean section stays out of the way. When `required_fields` is empty the
+incomplete section says so explicitly instead of claiming every contact is
+complete — nothing was checked, which is not the same as everything passing.
+
+## Report export
+
+Any audit can write its findings to a file or a pipe. The tables still print —
+export is in addition to the terminal output, not instead of it.
+
+```bash
+hubspot-crm-clean audit all -o findings.json     # one JSON file, all three audits
+hubspot-crm-clean audit all -o findings.csv      # three CSVs, one per audit
+hubspot-crm-clean audit stale -o stale.csv       # one audit, one file
+hubspot-crm-clean audit all -f json -o - | jq '.stale.findings'
+```
+
+**Picking the format.** Precedence is `--format` → the extension on `--output` →
+`reports.default_format` in your config. The extension outranks the config
+because it's part of *this* invocation. If none of the three settles it, the
+command stops and says so rather than guessing:
+
+```
+$ hubspot-crm-clean audit stale --output findings.txt
+Bad report options: could not tell the format from 'findings.txt': name it .csv
+or .json, or pass --format csv|json
+```
+
+Bad flags are caught *before* the fetch, so a typo costs you a second rather
+than a full pass over your portal.
+
+**One file or several.** JSON is one document, so `audit all` gets one file with
+a section per audit. CSV is flat and the three audits have three different column
+layouts, so `--output findings.csv` writes `findings-duplicates.csv`,
+`findings-incomplete.csv`, and `findings-stale.csv`. A single audit always keeps
+exactly the path you gave it. For the same reason `--format csv --output -` is
+rejected for `audit all` — three headers in one stream isn't a CSV file.
+
+**Streaming.** `--output -` sends the report to stdout and silences everything
+else, tables and progress bars included, so the output is safe to pipe. Passing
+`--format` without `--output` does the same thing. Errors still print, because a
+run that died has no data stream left to corrupt.
+
+**What's in the file.** Each audit's findings travel with the settings that
+produced them — a bare list of findings isn't reproducible, since "2 duplicates"
+means nothing without the threshold that decided it.
+
+```json
+{
+  "scanned": 5,
+  "stale": {
+    "inactive_days": 90,
+    "activity_fields": ["hs_last_activity_date", "lastmodifieddate"],
+    "findings": [
+      {"id": "5", "name": null, "email": "ghost@widgetco.com",
+       "days_inactive": null, "last_seen": null},
+      {"id": "4", "name": "Zoe Quinn", "email": "zoe@widgetco.com",
+       "days_inactive": 570, "last_seen": "2025-01-04T00:22:07+00:00"}
+    ]
+  }
+}
+```
+
+The export is the machine-readable twin of the table: same findings, same
+numbers, with the two things the table truncated purely for column width put
+back. A cluster's confidence repeats on every member row, because a CSV row has
+to stand alone once someone sorts the file, and `last_seen` keeps its time as
+well as its date. `days_inactive: null` is how "never heard from" is reported —
+the table's word `never` isn't something a spreadsheet formula should have to
+know about, and `null` and `0` are different answers.
+
+A run that finds nothing still writes its report, headers and all. A missing
+file and a file that says "nothing wrong" mean different things, and only one of
+them survives a scheduled run. `--strict` still exits 1, but the report is
+written first — CI is exactly where the artifact matters most.
+
+```
+$ hubspot-crm-clean audit stale --from-file clean.json -o stale.csv
+$ cat stale.csv
+id,name,email,days_inactive,last_seen
 ```
 
 ## How duplicate detection works
@@ -245,11 +443,18 @@ pytest          # run tests
 ruff check .    # lint
 ```
 
-All three audits have full test suites — 114 tests covering email normalization,
-domain bucketing, clustering, completeness scoring, timestamp parsing, staleness
-windows, and every CLI command end to end. The CLI tests drive the real commands
-through `--from-file`, so the whole suite runs offline with no HubSpot
-credentials and no network access.
+Everything has a test suite — 249 tests covering email normalization, domain
+bucketing, clustering, completeness scoring, timestamp parsing, staleness
+windows, config parsing and rejection, flag-over-config precedence, report row
+shapes, format resolution, and every CLI command end to end. The CLI tests drive
+the real commands through `--from-file`, so the whole suite runs offline with no
+HubSpot credentials and no network access.
+
+Two guards worth knowing about, both in `tests/conftest.py`: every test runs in
+an empty working directory (otherwise a real `config.yaml` sitting in the repo
+would retune the whole suite), and Rich's console width is pinned (otherwise an
+80-column fallback splits summary lines and breaks substring assertions for
+reasons unrelated to the code).
 
 Quick sanity check of the client in a Python REPL (from the project root, venv active):
 
@@ -266,8 +471,8 @@ contacts[0]        # inspect one record's shape
 src/hubspot_crm_clean/
 ├── cli.py            # Typer entrypoint — registers `fetch` and `audit` commands
 ├── client.py         # HubSpot client: auth, pagination, normalization
-├── config.py         # configuration handling
-├── reports.py        # report formatting/output
+├── config.py         # ✅ YAML config loading + strict validation
+├── reports.py        # ✅ CSV/JSON export + destination resolution
 └── audits/
     ├── duplicates.py # ✅ fuzzy matching + clustering
     ├── incomplete.py # ✅ completeness scoring
@@ -287,7 +492,13 @@ See `pyproject.toml` for the full dependency list.
 | 1 | HubSpot client + `fetch` command | ✅ Done |
 | 2 | Duplicate detection | ✅ Done |
 | 3 | Incomplete & stale record audits | ✅ Done |
-| 4 | Combined `audit all` + report export | 🚧 Planned |
+| 4 | Combined `audit all` + YAML config + report export | ✅ Done |
+
+Week 4 is complete. Still open, and deliberately rejected by the config loader
+rather than silently ignored: auditing objects other than contacts
+(`hubspot.object_types`), configurable duplicate match fields
+(`rules.duplicates.match_fields`), and choosing which columns a report carries
+(`reports.columns`).
 
 ## License
 

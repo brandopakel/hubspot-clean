@@ -15,7 +15,12 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from hubspot_crm_clean.audits.duplicates import find_duplicates, full_name, pair_count
+from hubspot_crm_clean.audits.duplicates import (
+    DEFAULT_THRESHOLD,
+    find_duplicates,
+    full_name,
+    pair_count,
+)
 from hubspot_crm_clean.audits.incomplete import (
     DEFAULT_MIN_COMPLETENESS,
     DEFAULT_REQUIRED_FIELDS,
@@ -27,6 +32,23 @@ from hubspot_crm_clean.audits.stale import (
     find_stale,
 )
 from hubspot_crm_clean.client import all_property_names, fetch_all_contacts
+from hubspot_crm_clean.config import (
+    DEFAULT_CONFIG_NAME,
+    DEFAULTS,
+    ConfigError,
+    find_config,
+    load_config,
+)
+from hubspot_crm_clean.reports import (
+    ReportError,
+    ReportFormat,
+    duplicates_section,
+    incomplete_section,
+    resolve_target,
+    stale_section,
+    streams_to_stdout,
+    write_report,
+)
 
 app = typer.Typer(
     help="hubspot-crm-clean: audit your HubSpot CRM for data hygiene issues.",
@@ -39,10 +61,10 @@ audit_app = typer.Typer(help="Run data hygiene audits.", no_args_is_help=True)
 app.add_typer(audit_app, name="audit")
 
 # Each audit declares what it reads — don't rely on whatever HubSpot defaults to.
-DUPLICATE_PROPERTIES = ["email", "firstname", "lastname"]
-INCOMPLETE_PROPERTIES = ["email", "firstname", "lastname", *DEFAULT_REQUIRED_FIELDS]
-STALE_PROPERTIES = ["email", "firstname", "lastname", *DEFAULT_ACTIVITY_FIELDS]
-FETCH_PROPERTIES = ["email", "firstname", "lastname", "company", "phone", "lifecyclestage"]
+# Which properties an audit needs now depends on config, so the field-driven sets
+# are built per run; only these two are fixed.
+IDENTITY_PROPERTIES = ["email", "firstname", "lastname"]     # every audit table shows these
+FETCH_PROPERTIES = [*IDENTITY_PROPERTIES, "company", "phone", "lifecyclestage"]
 
 # Shared option definitions, so every audit behaves the same way.
 FROM_FILE_OPTION = typer.Option(
@@ -52,12 +74,60 @@ FROM_FILE_OPTION = typer.Option(
 STRICT_OPTION = typer.Option(
     False, "--strict", help="Exit with code 1 when findings are reported (for CI).",
 )
+CONFIG_OPTION = typer.Option(
+    None, "--config", "-c", exists=True, dir_okay=False, readable=True,
+    help=f"YAML file supplying defaults. Falls back to ./{DEFAULT_CONFIG_NAME} when it exists.",
+)
+# The tuning options all default to None rather than their real default, because
+# that is the only way to tell "user asked for 85" from "user said nothing" — and
+# a config file may only fill in the second case. show_default carries the real
+# value into --help, which would otherwise advertise `None`.
+THRESHOLD_OPTION = typer.Option(
+    None, "--threshold", "-t", min=0, max=100, show_default=str(DEFAULT_THRESHOLD),
+    help="Name similarity score (0-100) required to call two contacts a match.",
+)
+MIN_COMPLETENESS_OPTION = typer.Option(
+    None, "--min-completeness", "-m", min=0, max=100,
+    show_default=str(DEFAULT_MIN_COMPLETENESS),
+    help="Flag contacts scoring below this percentage of required fields.",
+)
+INACTIVE_DAYS_OPTION = typer.Option(
+    None, "--inactive-days", "-d", min=0, show_default=str(DEFAULT_INACTIVE_DAYS),
+    help="Flag contacts with no activity in at least this many days.",
+)
 # Hoisted like the options above: builds its help text with a call, which can't sit
 # in a signature default.
 REQUIRED_OPTION = typer.Option(
     None, "--required", "-r",
     help=f"Required field, repeatable. Defaults to: {', '.join(DEFAULT_REQUIRED_FIELDS)}.",
 )
+ACTIVITY_FIELD_OPTION = typer.Option(
+    None, "--activity-field",
+    help="Timestamp field counted as activity, repeatable. "
+         f"Defaults to: {', '.join(DEFAULT_ACTIVITY_FIELDS)}.",
+)
+FORMAT_OPTION = typer.Option(
+    None, "--format", "-f",
+    help="Export findings in this format. Inferred from --output's extension when omitted.",
+)
+# No exists=/writable= checks: this path is being written, not read, and "-" has
+# to survive as a literal rather than being validated as a filename.
+OUTPUT_OPTION = typer.Option(
+    None, "--output", "-o", dir_okay=False,
+    help="Write the report here; '-' streams it to stdout. "
+         "Passing --format without --output streams to stdout too.",
+)
+
+
+def fail(message: str) -> typer.Exit:
+    """Print an error and exit 1. Raise the return value: `raise fail(...)`.
+
+    Un-quiets the console first. A run that dies has no report on stdout left to
+    corrupt, and a silent failure is far worse than a noisy one.
+    """
+    console.quiet = False
+    console.print(message)
+    return typer.Exit(code=1)
 
 
 def load_contacts(path: Path) -> list[dict]:
@@ -73,8 +143,66 @@ def resolve_contacts(from_file: Path | None, properties: list[str]) -> list[dict
             return load_contacts(from_file)
         return fetch_with_progress(properties)
     except Exception as err:  # noqa: BLE001 - CLI boundary: any failure becomes a clean message
-        console.print(f"[bold red]Failed to load contacts:[/bold red] {err}")
-        raise typer.Exit(code=1)
+        raise fail(f"[bold red]Failed to load contacts:[/bold red] {err}")
+
+
+def resolve_config(explicit: Path | None):
+    """Load the config supplying this run's defaults, or fall back to the built-ins.
+
+    Which file was applied is echoed, so a config picked up from the working
+    directory never changes results invisibly.
+    """
+    path = find_config(explicit)
+    if path is None:
+        return DEFAULTS
+    try:
+        config = load_config(path)
+    except ConfigError as err:
+        raise fail(f"[bold red]Bad config:[/bold red] {err}")
+    console.print(f"[dim]Using config {path}[/dim]")
+    return config
+
+
+def resolve_report(report_format, output, default_format, multi: bool = False):
+    """Where this run's report goes, or None when no export was asked for.
+
+    Called before any fetching, so a bad --format/--output pair fails in a second
+    rather than after paging through the whole portal.
+    """
+    try:
+        return resolve_target(report_format, output, default_format, multi=multi)
+    except ReportError as err:
+        raise fail(f"[bold red]Bad report options:[/bold red] {err}")
+
+
+def export(target, scanned: int, sections: dict) -> None:
+    """Write the report, if one was asked for, and say where it went."""
+    if target is None:
+        return
+    try:
+        written = write_report(target, scanned, sections)
+    except OSError as err:
+        raise fail(f"[bold red]Failed to write report:[/bold red] {err}")
+    for path in written:
+        # soft_wrap so a long path stays on one line and survives a copy-paste
+        console.print(f"[dim]Wrote {path}[/dim]", soft_wrap=True)
+
+
+def pick(flag, configured):
+    """Resolve one option: an explicit flag wins, otherwise the config's value.
+
+    `is None` rather than truthiness — `-t 0` and `-d 0` are real choices.
+    """
+    return configured if flag is None else flag
+
+
+def unique(*groups):
+    """Flatten property lists into one, first occurrence wins.
+
+    dict keys deduplicate while preserving order, which keeps the request
+    stable rather than reshuffling with set iteration.
+    """
+    return list(dict.fromkeys(name for group in groups for name in group))
 
 
 def clean_panel(message: str, subtitle: str) -> Panel:
@@ -131,6 +259,28 @@ def batched_advance(progress: Progress, task, every: int = 2000):
     return advance
 
 
+def duplicates_with_progress(contacts: list[dict], threshold: int) -> list:
+    """find_duplicates, wrapped in the live comparison bar. Shared with `audit all`."""
+    with Progress(
+        SpinnerColumn(style="green"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(complete_style="green", finished_style="green"),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,    # leave the results, not the scaffolding
+    ) as progress:
+        total_pairs = pair_count(contacts)
+        task = progress.add_task("Comparing names", total=total_pairs)
+        clusters = find_duplicates(
+            contacts,
+            threshold=threshold,
+            on_progress=batched_advance(progress, task),
+        )
+        progress.update(task, completed=total_pairs)   # flush the last partial batch
+    return clusters
+
+
 def confidence_style(score: float) -> str:
     """Colour-code how much to trust a cluster."""
     if score >= 95:
@@ -158,6 +308,100 @@ def staleness_style(days: int, cutoff: int) -> str:
     return "yellow"
 
 
+# --------------------------------------------------------------------------
+# Renderers
+#
+# Tables only — the summary line stays with the caller, because a single audit
+# reports its own count in a panel while `audit all` folds all three into one.
+# --------------------------------------------------------------------------
+
+def render_duplicates(clusters: list, threshold: int) -> None:
+    """Print the duplicate clusters table."""
+    table = audit_table(f"[bold]Probable duplicates[/bold]  [dim](threshold {threshold})[/dim]")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Conf", justify="right")
+    table.add_column("ID", style="dim")
+    table.add_column("Name")
+    table.add_column("Email", style="cyan")
+
+    for number, cluster in enumerate(clusters, start=1):
+        style = confidence_style(cluster.confidence)
+        for row, member in enumerate(cluster.members):
+            first_row = row == 0  # only label the cluster once, on its first line
+            table.add_row(
+                str(number) if first_row else "",
+                f"[{style}]{cluster.confidence:.0f}[/{style}]" if first_row else "",
+                str(member["id"]),
+                full_name(member) or "[dim]-[/dim]",
+                member["properties"].get("email") or "[dim]-[/dim]",
+            )
+        table.add_section()
+
+    console.print(table)
+
+
+def render_incomplete(flagged: list, min_completeness: int) -> None:
+    """Print the incomplete contacts table."""
+    table = audit_table(
+        f"[bold]Incomplete contacts[/bold]  [dim](below {min_completeness}%)[/dim]"
+    )
+    table.add_column("Score", justify="right")
+    table.add_column("ID", style="dim")
+    table.add_column("Name")
+    table.add_column("Email", style="cyan")
+    table.add_column("Missing")
+
+    for item in flagged:
+        style = completeness_style(item.score)
+        table.add_row(
+            f"[{style}]{item.score:.0f}%[/{style}]",
+            str(item.contact["id"]),
+            full_name(item.contact) or "[dim]-[/dim]",
+            item.contact["properties"].get("email") or "[dim]-[/dim]",
+            "[dim]" + ", ".join(item.missing) + "[/dim]",
+        )
+
+    console.print(table)
+
+
+def render_stale(flagged: list, inactive_days: int) -> None:
+    """Print the stale contacts table."""
+    table = audit_table(
+        f"[bold]Stale contacts[/bold]  [dim](no activity in {inactive_days}+ days)[/dim]"
+    )
+    table.add_column("Days", justify="right")
+    table.add_column("ID", style="dim")
+    table.add_column("Name")
+    table.add_column("Email", style="cyan")
+    table.add_column("Last activity")
+
+    for item in flagged:
+        if item.days_inactive is None:
+            days_cell, last_cell = "[dim]never[/dim]", "[dim]-[/dim]"
+        else:
+            style = staleness_style(item.days_inactive, inactive_days)
+            days_cell = f"[{style}]{item.days_inactive}[/{style}]"
+            last_cell = item.last_seen.date().isoformat()
+        table.add_row(
+            days_cell,
+            str(item.contact["id"]),
+            full_name(item.contact) or "[dim]-[/dim]",
+            item.contact["properties"].get("email") or "[dim]-[/dim]",
+            last_cell,
+        )
+
+    console.print(table)
+
+
+def never_seen(flagged: list) -> int:
+    """How many stale contacts have no usable activity date at all."""
+    return sum(1 for item in flagged if item.days_inactive is None)
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
 @app.command()
 def fetch(
     all_properties: bool = typer.Option(
@@ -180,89 +424,66 @@ def fetch(
         raise typer.Exit(code=1)
     console.print(f"[bold green]Found {len(contacts)} contacts.[/bold green]")
 
+
 @audit_app.command("duplicates")
 def audit_duplicates(
-    threshold: int = typer.Option(
-        85, "--threshold", "-t", min=0, max=100,
-        help="Name similarity score (0-100) required to call two contacts a match.",
-    ),
+    threshold: int | None = THRESHOLD_OPTION,
     from_file: Path | None = FROM_FILE_OPTION,
     strict: bool = STRICT_OPTION,
+    config: Path | None = CONFIG_OPTION,
+    report_format: ReportFormat | None = FORMAT_OPTION,
+    output: Path | None = OUTPUT_OPTION,
 ):
     """Detect probable duplicate contacts."""
-    contacts = resolve_contacts(from_file, DUPLICATE_PROPERTIES)
+    # Set unconditionally, never toggled off later: the console is a module global,
+    # so leaving it quiet would silence the next run in the same process.
+    console.quiet = streams_to_stdout(report_format, output)
+    settings = resolve_config(config)
+    threshold = pick(threshold, settings.threshold)
+    target = resolve_report(report_format, output, settings.default_format)
 
-    with Progress(
-        SpinnerColumn(style="green"),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(complete_style="green", finished_style="green"),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,    # leave the results, not the scaffolding
-    ) as progress:
-        total_pairs = pair_count(contacts)
-        task = progress.add_task("Comparing names", total=total_pairs)
-        clusters = find_duplicates(
-            contacts,
-            threshold=threshold,
-            on_progress=batched_advance(progress, task),
-        )
-        progress.update(task, completed=total_pairs)   # flush the last partial batch
+    contacts = resolve_contacts(from_file, IDENTITY_PROPERTIES)
+    clusters = duplicates_with_progress(contacts, threshold)
 
     if not clusters:
         console.print(clean_panel(
             f"[bold green]No duplicates found[/bold green] in {len(contacts)} contacts.",
             f"threshold {threshold}",
         ))
-        return
+    else:
+        render_duplicates(clusters, threshold)
+        involved = sum(len(cluster.members) for cluster in clusters)
+        console.print(summary_panel(
+            f"[bold yellow]{len(clusters)}[/bold yellow] cluster(s)  [dim]|[/dim]  "
+            f"[bold yellow]{involved}[/bold yellow] contacts involved  [dim]|[/dim]  "
+            f"[dim]{len(contacts)} scanned[/dim]"
+        ))
 
-    table = audit_table(f"[bold]Probable duplicates[/bold]  [dim](threshold {threshold})[/dim]")
-    table.add_column("#", justify="right", style="dim")
-    table.add_column("Conf", justify="right")
-    table.add_column("ID", style="dim")
-    table.add_column("Name")
-    table.add_column("Email", style="cyan")
-
-    for number, cluster in enumerate(clusters, start=1):
-        style = confidence_style(cluster.confidence)
-        for row, member in enumerate(cluster.members):
-            first_row = row == 0  # only label the cluster once, on its first line
-            table.add_row(
-                str(number) if first_row else "",
-                f"[{style}]{cluster.confidence:.0f}[/{style}]" if first_row else "",
-                str(member["id"]),
-                full_name(member) or "[dim]-[/dim]",
-                member["properties"].get("email") or "[dim]-[/dim]",
-            )
-        table.add_section()
-
-    console.print(table)
-    involved = sum(len(cluster.members) for cluster in clusters)
-    console.print(summary_panel(
-        f"[bold yellow]{len(clusters)}[/bold yellow] cluster(s)  [dim]|[/dim]  "
-        f"[bold yellow]{involved}[/bold yellow] contacts involved  [dim]|[/dim]  "
-        f"[dim]{len(contacts)} scanned[/dim]"
-    ))
-    if strict:
+    # After rendering and before --strict: a clean run still owes you a report,
+    # and exiting 1 must not be what decides whether the file gets written.
+    export(target, len(contacts), {"duplicates": duplicates_section(clusters, threshold)})
+    if clusters and strict:
         raise typer.Exit(code=1)
 
 
 @audit_app.command("incomplete")
 def audit_incomplete(
-    min_completeness: int = typer.Option(
-        DEFAULT_MIN_COMPLETENESS, "--min-completeness", "-m", min=0, max=100,
-        help="Flag contacts scoring below this percentage of required fields.",
-    ),
+    min_completeness: int | None = MIN_COMPLETENESS_OPTION,
     required: list[str] | None = REQUIRED_OPTION,
     from_file: Path | None = FROM_FILE_OPTION,
     strict: bool = STRICT_OPTION,
+    config: Path | None = CONFIG_OPTION,
+    report_format: ReportFormat | None = FORMAT_OPTION,
+    output: Path | None = OUTPUT_OPTION,
 ):
     """Flag contacts missing required fields."""
-    fields = list(required) if required else DEFAULT_REQUIRED_FIELDS
-    properties = ["email", "firstname", "lastname", *fields]
-    contacts = resolve_contacts(from_file, properties)
+    console.quiet = streams_to_stdout(report_format, output)
+    settings = resolve_config(config)
+    min_completeness = pick(min_completeness, settings.min_completeness)
+    fields = list(required) if required else settings.required_fields
+    target = resolve_report(report_format, output, settings.default_format)
 
+    contacts = resolve_contacts(from_file, unique(IDENTITY_PROPERTIES, fields))
     flagged = find_incomplete(contacts, fields, min_completeness)
 
     if not flagged:
@@ -270,97 +491,143 @@ def audit_incomplete(
             f"[bold green]All {len(contacts)} contacts[/bold green] meet the completeness bar.",
             f"min {min_completeness}% of {len(fields)} fields",
         ))
-        return
+    else:
+        render_incomplete(flagged, min_completeness)
+        console.print(summary_panel(
+            f"[bold yellow]{len(flagged)}[/bold yellow] incomplete  [dim]|[/dim]  "
+            f"[dim]{len(contacts)} scanned  |  required: {', '.join(fields)}[/dim]"
+        ))
 
-    table = audit_table(
-        f"[bold]Incomplete contacts[/bold]  [dim](below {min_completeness}%)[/dim]"
-    )
-    table.add_column("Score", justify="right")
-    table.add_column("ID", style="dim")
-    table.add_column("Name")
-    table.add_column("Email", style="cyan")
-    table.add_column("Missing")
-
-    for item in flagged:
-        style = completeness_style(item.score)
-        table.add_row(
-            f"[{style}]{item.score:.0f}%[/{style}]",
-            str(item.contact["id"]),
-            full_name(item.contact) or "[dim]-[/dim]",
-            item.contact["properties"].get("email") or "[dim]-[/dim]",
-            "[dim]" + ", ".join(item.missing) + "[/dim]",
-        )
-
-    console.print(table)
-    console.print(summary_panel(
-        f"[bold yellow]{len(flagged)}[/bold yellow] incomplete  [dim]|[/dim]  "
-        f"[dim]{len(contacts)} scanned  |  required: {', '.join(fields)}[/dim]"
-    ))
-    if strict:
+    export(target, len(contacts), {
+        "incomplete": incomplete_section(flagged, min_completeness, fields),
+    })
+    if flagged and strict:
         raise typer.Exit(code=1)
 
 
 @audit_app.command("stale")
 def audit_stale(
-    inactive_days: int = typer.Option(
-        DEFAULT_INACTIVE_DAYS, "--inactive-days", "-d", min=0,
-        help="Flag contacts with no activity in at least this many days.",
-    ),
+    inactive_days: int | None = INACTIVE_DAYS_OPTION,
+    activity_field: list[str] | None = ACTIVITY_FIELD_OPTION,
     from_file: Path | None = FROM_FILE_OPTION,
     strict: bool = STRICT_OPTION,
+    config: Path | None = CONFIG_OPTION,
+    report_format: ReportFormat | None = FORMAT_OPTION,
+    output: Path | None = OUTPUT_OPTION,
 ):
     """Flag contacts with no recent activity."""
-    contacts = resolve_contacts(from_file, STALE_PROPERTIES)
+    console.quiet = streams_to_stdout(report_format, output)
+    settings = resolve_config(config)
+    inactive_days = pick(inactive_days, settings.inactive_days)
+    fields = list(activity_field) if activity_field else settings.activity_fields
+    target = resolve_report(report_format, output, settings.default_format)
 
-    flagged = find_stale(contacts, inactive_days=inactive_days)
+    contacts = resolve_contacts(from_file, unique(IDENTITY_PROPERTIES, fields))
+    flagged = find_stale(contacts, inactive_days=inactive_days, activity_fields=fields)
 
     if not flagged:
         console.print(clean_panel(
             f"[bold green]All {len(contacts)} contacts[/bold green] show recent activity.",
             f"within {inactive_days} days",
         ))
-        return
+    else:
+        render_stale(flagged, inactive_days)
+        never = never_seen(flagged)
+        never_note = f"  [dim]|[/dim]  [dim]{never} never seen[/dim]" if never else ""
+        console.print(summary_panel(
+            f"[bold yellow]{len(flagged)}[/bold yellow] stale  [dim]|[/dim]  "
+            f"[dim]{len(contacts)} scanned[/dim]{never_note}"
+        ))
 
-    table = audit_table(
-        f"[bold]Stale contacts[/bold]  [dim](no activity in {inactive_days}+ days)[/dim]"
-    )
-    table.add_column("Days", justify="right")
-    table.add_column("ID", style="dim")
-    table.add_column("Name")
-    table.add_column("Email", style="cyan")
-    table.add_column("Last activity")
-
-    never = 0
-    for item in flagged:
-        if item.days_inactive is None:
-            never += 1
-            days_cell, last_cell = "[dim]never[/dim]", "[dim]-[/dim]"
-        else:
-            style = staleness_style(item.days_inactive, inactive_days)
-            days_cell = f"[{style}]{item.days_inactive}[/{style}]"
-            last_cell = item.last_seen.date().isoformat()
-        table.add_row(
-            days_cell,
-            str(item.contact["id"]),
-            full_name(item.contact) or "[dim]-[/dim]",
-            item.contact["properties"].get("email") or "[dim]-[/dim]",
-            last_cell,
-        )
-
-    console.print(table)
-    never_note = f"  [dim]|[/dim]  [dim]{never} never seen[/dim]" if never else ""
-    console.print(summary_panel(
-        f"[bold yellow]{len(flagged)}[/bold yellow] stale  [dim]|[/dim]  "
-        f"[dim]{len(contacts)} scanned[/dim]{never_note}"
-    ))
-    if strict:
+    export(target, len(contacts), {
+        "stale": stale_section(flagged, inactive_days, fields),
+    })
+    if flagged and strict:
         raise typer.Exit(code=1)
 
 
 @audit_app.command("all")
-def audit_all():
-    """Run every audit at once (Week 4)."""
-    raise NotImplementedError
+def audit_all(
+    threshold: int | None = THRESHOLD_OPTION,
+    min_completeness: int | None = MIN_COMPLETENESS_OPTION,
+    required: list[str] | None = REQUIRED_OPTION,
+    inactive_days: int | None = INACTIVE_DAYS_OPTION,
+    activity_field: list[str] | None = ACTIVITY_FIELD_OPTION,
+    from_file: Path | None = FROM_FILE_OPTION,
+    strict: bool = STRICT_OPTION,
+    config: Path | None = CONFIG_OPTION,
+    report_format: ReportFormat | None = FORMAT_OPTION,
+    output: Path | None = OUTPUT_OPTION,
+):
+    """Run every audit at once against a single fetch."""
+    console.quiet = streams_to_stdout(report_format, output)
+    settings = resolve_config(config)
+    threshold = pick(threshold, settings.threshold)
+    min_completeness = pick(min_completeness, settings.min_completeness)
+    inactive_days = pick(inactive_days, settings.inactive_days)
+    fields = list(required) if required else settings.required_fields
+    activity_fields = list(activity_field) if activity_field else settings.activity_fields
+    # multi=True: three audits mean three csv files, and no csv on stdout at all.
+    target = resolve_report(report_format, output, settings.default_format, multi=True)
+
+    # One fetch, one union of every property the three audits read — running the
+    # commands separately would page through the whole portal three times.
+    properties = unique(IDENTITY_PROPERTIES, fields, activity_fields)
+    contacts = resolve_contacts(from_file, properties)
+
+    console.rule("[bold cyan]Duplicates[/bold cyan]")
+    clusters = duplicates_with_progress(contacts, threshold)
+    if clusters:
+        render_duplicates(clusters, threshold)
+    else:
+        console.print(f"  [green]No duplicates[/green]  [dim](threshold {threshold})[/dim]")
+
+    console.rule("[bold cyan]Incomplete[/bold cyan]")
+    incomplete = find_incomplete(contacts, fields, min_completeness)
+    if incomplete:
+        render_incomplete(incomplete, min_completeness)
+    elif not fields:
+        console.print("  [dim]No required fields configured - nothing to check.[/dim]")
+    else:
+        console.print(
+            f"  [green]All contacts complete[/green]  [dim](min {min_completeness}%)[/dim]"
+        )
+
+    console.rule("[bold cyan]Stale[/bold cyan]")
+    stale = find_stale(contacts, inactive_days=inactive_days, activity_fields=activity_fields)
+    if stale:
+        render_stale(stale, inactive_days)
+    else:
+        console.print(
+            f"  [green]All contacts active[/green]  [dim](within {inactive_days} days)[/dim]"
+        )
+
+    console.rule("[bold]Summary[/bold]")
+    found = len(clusters) + len(incomplete) + len(stale)
+    if not found:
+        console.print(clean_panel(
+            f"[bold green]No issues found[/bold green] in {len(contacts)} contacts.",
+            "3 audits",
+        ))
+    else:
+        never = never_seen(stale)
+        never_note = f"  [dim]|[/dim]  [dim]{never} never seen[/dim]" if never else ""
+        console.print(summary_panel(
+            f"[bold yellow]{len(clusters)}[/bold yellow] duplicate cluster(s)  [dim]|[/dim]  "
+            f"[bold yellow]{len(incomplete)}[/bold yellow] incomplete  [dim]|[/dim]  "
+            f"[bold yellow]{len(stale)}[/bold yellow] stale  [dim]|[/dim]  "
+            f"[dim]{len(contacts)} scanned[/dim]{never_note}"
+        ))
+
+    # Insertion order is the section order in the JSON file and the order the csv
+    # files are named, so it matches the order the audits ran above.
+    export(target, len(contacts), {
+        "duplicates": duplicates_section(clusters, threshold),
+        "incomplete": incomplete_section(incomplete, min_completeness, fields),
+        "stale": stale_section(stale, inactive_days, activity_fields),
+    })
+    if found and strict:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

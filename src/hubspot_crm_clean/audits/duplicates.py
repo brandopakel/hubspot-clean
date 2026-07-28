@@ -20,6 +20,9 @@ from typing import NamedTuple
 
 from rapidfuzz import fuzz, utils
 
+# Mirrors rules.duplicates.match_threshold in config.example.yaml.
+DEFAULT_THRESHOLD = 85
+
 DOMAIN_TYPOS = {"googlemail.com": "gmail.com",
                 "gmial.com": "gmail.com",
                 "ggmai.com": "gmail.com",
@@ -101,7 +104,7 @@ def pair_count(contacts):
     """How many comparisons find_duplicates will make. Lets callers size a progress bar."""
     return sum(len(b) * (len(b) - 1) // 2 for b in email_groups(contacts).values())
 
-def find_duplicates(contacts, threshold=85, on_progress=None):
+def find_duplicates(contacts, threshold=DEFAULT_THRESHOLD, on_progress=None):
     """Detect duplicate contacts, merged into clusters. Highest confidence first.
 
     on_progress, if given, is called with 1 per comparison — see pair_count() for the
