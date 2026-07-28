@@ -51,3 +51,8 @@ reports:
 #                          duplicate matching is fixed at email-domain bucketing
 #                          plus fuzzy first/last name comparison
 #   reports.columns        which columns each report carries is fixed today
+#   merge.*                which record survives a merge is fixed at
+#                          most complete -> oldest -> lowest id
+#
+# Note that rules.incomplete.required_fields does reach `merge`: it decides which
+# record counts as "most complete", and so which one survives.

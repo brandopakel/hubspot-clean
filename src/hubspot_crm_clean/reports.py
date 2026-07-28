@@ -22,6 +22,7 @@ Two shape rules fall out of CSV being flat and JSON being not:
 import csv
 import json
 import sys
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
@@ -30,6 +31,20 @@ from hubspot_crm_clean.audits.duplicates import full_name
 
 # What `--output` accepts to mean "stream it to stdout instead of a file".
 STDOUT = "-"
+
+# --save filenames: hubspot-duplicates-20260727-143022.json
+#
+# The timestamp lives in the *name*, deliberately, and not in the contents. Two
+# runs of the same audit produce byte-identical files, so you can diff yesterday
+# against today - while the names still never collide.
+NAME_PREFIX = "hubspot"
+NAME_STAMP = "%Y%m%d-%H%M%S"
+
+# What --save falls back to when nothing else picks a format. There's no default
+# for --output on purpose (see resolve_target), but --save means "you choose
+# everything", and JSON is the one format that yields a single file for every
+# command.
+SAVE_FORMAT_FALLBACK = "json"
 
 
 class ReportError(ValueError):
@@ -60,6 +75,8 @@ COLUMNS = {
     "duplicates": ["cluster", "confidence", "domain", "id", "name", "email"],
     "incomplete": ["id", "name", "email", "score", "missing"],
     "stale": ["id", "name", "email", "days_inactive", "last_seen"],
+    "merges": ["cluster", "confidence", "role", "id", "name", "email",
+               "reason", "status", "detail"],
 }
 
 SUFFIXES = {".csv": ReportFormat.CSV, ".json": ReportFormat.JSON}
@@ -155,31 +172,126 @@ def stale_section(flagged, inactive_days, activity_fields):
     }
 
 
+def merge_rows(outcomes):
+    """Flatten merge outcomes into one row per record involved.
+
+    The surviving record gets a row too, marked `kept`. A file listing only what
+    was removed can't tell you what it was removed *into*, which is the one thing
+    you need when a merge turns out to be wrong.
+    """
+    rows = []
+    for number, outcome in enumerate(outcomes, start=1):
+        plan = outcome.plan
+        failed = dict(outcome.failures)
+
+        def row(contact, role, status, detail=None, number=number, plan=plan):
+            return {
+                "cluster": number,
+                "confidence": round(plan.confidence),
+                "role": role,
+                "id": contact["id"],
+                "name": full_name(contact) or None,
+                "email": contact["properties"].get("email") or None,
+                "reason": plan.reason if role == "kept" else None,
+                "status": status,
+                "detail": detail,
+            }
+
+        rows.append(row(plan.primary, "kept", "kept"))
+        for contact in plan.absorbed:
+            if contact["id"] in failed:
+                rows.append(row(contact, "absorbed", "failed", failed[contact["id"]]))
+            elif contact["id"] in outcome.merged:
+                rows.append(row(contact, "absorbed", "merged"))
+            else:
+                rows.append(row(contact, "absorbed", "planned"))    # dry run
+    return rows
+
+
+def merges_section(outcomes, threshold, applied):
+    """`applied` is what separates a record of what happened from a proposal."""
+    return {
+        "threshold": threshold,
+        "applied": applied,
+        "findings": merge_rows(outcomes),
+    }
+
+
 # --------------------------------------------------------------------------
 # Destination
 # --------------------------------------------------------------------------
 
-def streams_to_stdout(report_format, output):
+def streams_to_stdout(report_format, output, save=False):
     """True when the report goes to stdout, so the CLI must print nothing else.
 
     Decided by the flags alone - deliberately, because the CLI has to silence its
     console before it reads the config file, and reading the config prints a line.
     """
+    if save:
+        # --save always names a file. Without this, `--save --format json` would
+        # look exactly like `--format json` (which does stream) and the report
+        # would go down the pipe instead of to the file it just named.
+        return False
     if report_format is None and output is None:
         return False        # no export asked for at all
     return output is None or str(output) == STDOUT
 
 
-def resolve_target(report_format, output, default_format=None, multi=False):
+def auto_name(label, report_format, now=None, parts=(), exists=None):
+    """A generated filename for --save: hubspot-duplicates-20260727-143022.json
+
+    `now` is injectable so tests don't depend on the wall clock, the same way
+    find_stale takes one. Local time rather than UTC, because this name is read
+    by a human looking at their own directory.
+
+    A second run inside the same second would otherwise overwrite the first, so
+    the name gains a counter. `parts` names the csv siblings that will really be
+    written, since for a multi-file csv export the base name never exists on disk
+    and checking it alone would always report free.
+    """
+    # Local wall-clock time is the point here, hence the suppression below: this
+    # string is read by a human scanning their own directory, so 14:30 in the
+    # filename should mean their 14:30.
+    now = datetime.now() if now is None else now      # noqa: DTZ005
+    exists = (lambda path: path.is_file()) if exists is None else exists
+    stem = f"{NAME_PREFIX}-{label}-{now.strftime(NAME_STAMP)}"
+    suffix = f".{report_format.value}"
+
+    def taken(candidate):
+        if not parts:
+            return exists(candidate)
+        return any(exists(path) for path in csv_paths(candidate, list(parts)).values())
+
+    candidate = Path(f"{stem}{suffix}")
+    counter = 2
+    while taken(candidate):
+        candidate = Path(f"{stem}-{counter}{suffix}")
+        counter += 1
+    return candidate
+
+
+def resolve_target(report_format, output, default_format=None, multi=False,
+                   save=False, label="audit", now=None, parts=()):
     """Work out where the report goes, or None when no export was asked for.
 
     Format precedence is flag -> the extension on --output -> the config file's
     default_format. The extension outranks the config because it is part of this
-    invocation, and the more specific request should win.
+    invocation, and the more specific request should win. --save adds one last
+    rung: having said "you pick the name", failing because no format was named
+    would be missing the point, so it ends at JSON.
 
     Raises ReportError on a combination we can't honor. The CLI calls this before
     fetching anything, so bad flags fail in a second instead of after a full sync.
     """
+    if save and output is not None:
+        raise ReportError(
+            "--save picks the filename, so it can't be combined with --output. "
+            "Drop whichever one you didn't mean"
+        )
+    if save:
+        resolved = report_format or default_format or ReportFormat(SAVE_FORMAT_FALLBACK)
+        siblings = parts if (resolved is ReportFormat.CSV and multi) else ()
+        return ReportTarget(resolved, auto_name(label, resolved, now=now, parts=siblings))
     if report_format is None and output is None:
         return None
     to_stdout = streams_to_stdout(report_format, output)

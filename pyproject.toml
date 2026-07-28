@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hubspot-crm-clean"
 version = "0.1.0"
-description = "A CLI tool that audits HubSpot CRM records and reports data hygiene issues."
+description = "A CLI that audits HubSpot CRM contacts for data hygiene issues and merges the duplicates it finds."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
-    { name = "Your Name" }
+    { name = "Brando Pakel" }
 ]
 
 dependencies = [

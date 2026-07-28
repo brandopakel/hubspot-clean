@@ -2,6 +2,7 @@ import os
 
 from dotenv import load_dotenv
 from hubspot import HubSpot
+from hubspot.crm.contacts import PublicMergeInput
 
 load_dotenv()
 
@@ -41,6 +42,25 @@ def all_property_names(object_type: str = "contacts") -> list[str]:
     ct = get_client()
     response = ct.crm.properties.core_api.get_all(object_type)
     return [prop.name for prop in response.results]
+
+
+def merge_contacts(primary_id, merge_id) -> None:
+    '''Fold one contact into another. THIS WRITES TO YOUR CRM AND CANNOT BE UNDONE.
+
+    The primary survives, keeping its own value wherever the two records disagree
+    on a property; the other record's id stops resolving. Requires the
+    crm.objects.contacts.write scope, which the read-only audits do not need.
+
+    Ids are stringified because HubSpot rejects a numeric id here, and a contact
+    dict from normalize_contacts carries whatever type the API sent.
+    '''
+    ct = get_client()
+    ct.crm.contacts.basic_api.merge(
+        public_merge_input=PublicMergeInput(
+            primary_object_id=str(primary_id),
+            object_id_to_merge=str(merge_id),
+        )
+    )
 
 
 def normalize_contacts(contacts: list) -> list[dict]:

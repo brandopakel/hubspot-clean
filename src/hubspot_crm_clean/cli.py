@@ -33,7 +33,7 @@ from hubspot_crm_clean.audits.stale import (
     find_stale,
     unparseable_dates,
 )
-from hubspot_crm_clean.client import all_property_names, fetch_all_contacts
+from hubspot_crm_clean.client import all_property_names, fetch_all_contacts, merge_contacts
 from hubspot_crm_clean.config import (
     DEFAULT_CONFIG_NAME,
     DEFAULTS,
@@ -41,11 +41,19 @@ from hubspot_crm_clean.config import (
     find_config,
     load_config,
 )
+from hubspot_crm_clean.merges import (
+    MergeOutcome,
+    apply_plans,
+    failure_count,
+    merge_count,
+    plan_merges,
+)
 from hubspot_crm_clean.reports import (
     ReportError,
     ReportFormat,
     duplicates_section,
     incomplete_section,
+    merges_section,
     resolve_target,
     stale_section,
     streams_to_stdout,
@@ -53,7 +61,8 @@ from hubspot_crm_clean.reports import (
 )
 
 app = typer.Typer(
-    help="hubspot-crm-clean: audit your HubSpot CRM for data hygiene issues.",
+    help="hubspot-crm-clean: audit your HubSpot CRM for data hygiene issues, "
+         "and merge the duplicates it finds.",
     rich_markup_mode="rich",
     no_args_is_help=True,
 )
@@ -67,6 +76,9 @@ app.add_typer(audit_app, name="audit")
 # are built per run; only these two are fixed.
 IDENTITY_PROPERTIES = ["email", "firstname", "lastname"]     # every audit table shows these
 FETCH_PROPERTIES = [*IDENTITY_PROPERTIES, "company", "phone", "lifecyclestage"]
+# merge needs createdate on top of whatever it scores completeness against: the
+# oldest record wins the tie-break when two are equally complete.
+MERGE_PROPERTIES = [*IDENTITY_PROPERTIES, "createdate"]
 
 # Shared option definitions, so every audit behaves the same way.
 FROM_FILE_OPTION = typer.Option(
@@ -124,6 +136,25 @@ OUTPUT_OPTION = typer.Option(
     help="Write the report here; '-' streams it to stdout. "
          "Passing --format without --output streams to stdout too.",
 )
+SAVE_OPTION = typer.Option(
+    False, "--save", "-s",
+    help="Write a report to a generated filename in the current directory, "
+         "e.g. hubspot-duplicates-20260727-143022.json. Defaults to json.",
+)
+# merge only. --apply is the one flag in this project that changes your CRM, so
+# it is opt-in, it is spelled out in full, and it has no short form to fat-finger.
+APPLY_OPTION = typer.Option(
+    False, "--apply",
+    help="Actually perform the merges. Without this, nothing is written.",
+)
+YES_OPTION = typer.Option(
+    False, "--yes", "-y", help="Skip the confirmation prompt (for scripts and CI).",
+)
+LIMIT_OPTION = typer.Option(
+    None, "--limit", "-n", min=1,
+    help="Merge at most this many clusters. Clusters are ordered by confidence, "
+         "so a limited run acts on the ones we're surest about.",
+)
 
 
 def fail(message: str) -> typer.Exit:
@@ -170,14 +201,16 @@ def resolve_config(explicit: Path | None):
     return config
 
 
-def resolve_report(report_format, output, default_format, multi: bool = False):
+def resolve_report(report_format, output, default_format, multi: bool = False,
+                   save: bool = False, label: str = "audit", parts=()):
     """Where this run's report goes, or None when no export was asked for.
 
     Called before any fetching, so a bad --format/--output pair fails in a second
     rather than after paging through the whole portal.
     """
     try:
-        return resolve_target(report_format, output, default_format, multi=multi)
+        return resolve_target(report_format, output, default_format, multi=multi,
+                              save=save, label=label, parts=parts)
     except ReportError as err:
         raise fail(f"[bold red]Bad report options:[/bold red] {err}")
 
@@ -286,6 +319,41 @@ def duplicates_with_progress(contacts: list[dict], threshold: int) -> list:
         )
         progress.update(task, completed=total_pairs)   # flush the last partial batch
     return clusters
+
+
+def _preview(plan):
+    """A plan dressed as an outcome where nothing has happened yet.
+
+    Lets the dry run and the real run share one renderer and one report section,
+    so a preview can't drift from the thing it previews.
+    """
+    return MergeOutcome(plan, merged=[], failures=[])
+
+
+def confirm_merge(total: int, survivors: int) -> bool:
+    """Ask before writing. Merges cannot be undone from here or from HubSpot."""
+    console.print(
+        f"\n[bold yellow]About to merge {total} contact(s) into {survivors} "
+        f"survivor(s).[/bold yellow]  [bold red]This cannot be undone.[/bold red]"
+    )
+    return typer.confirm("Continue?")
+
+
+def merge_with_progress(plans: list, total: int) -> list:
+    """apply_plans, wrapped in a live progress bar."""
+    with Progress(
+        SpinnerColumn(style="green"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(complete_style="green", finished_style="green"),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Merging", total=total)
+        return apply_plans(
+            plans, merge_contacts, on_progress=lambda amount: progress.advance(task, amount)
+        )
 
 
 def confidence_style(score: float) -> str:
@@ -416,7 +484,7 @@ def never_seen(flagged: list) -> int:
 def report_skipped(verbose: bool, *counts) -> None:
     """Say what the audit couldn't look at, given (count, label) pairs.
 
-    Printed whether or not anything was found, and whether or not --verbose was
+    Printed whether anything was found, and whether --verbose was
     passed. A clean result that quietly excluded records is overclaiming, and a
     warning you only see once you know to ask for it isn't a warning.
     """
@@ -446,6 +514,58 @@ def render_excluded(excluded: list) -> None:
             item.contact["properties"].get("email") or "[dim]-[/dim]",
             f"[yellow]{item.reason}[/yellow]",
         )
+
+    console.print(table)
+
+
+def render_merge_plan(outcomes: list, applied: bool) -> None:
+    """Print what each cluster resolves to: one survivor, the rest folded in.
+
+    The same table serves the dry run and the real run - only the Status column
+    differs. Showing a preview through different code than the thing it previews
+    is how a preview ends up lying.
+    """
+    title = "[bold]Merges[/bold]  " + (
+        "[dim](applied)[/dim]" if applied
+        else "[bold yellow](DRY RUN - nothing written)[/bold yellow]"
+    )
+    table = audit_table(title)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Conf", justify="right")
+    table.add_column("", style="dim")           # Keep / Merge
+    table.add_column("ID", style="dim")
+    table.add_column("Name")
+    table.add_column("Email", style="cyan")
+    table.add_column("Status")
+
+    for number, outcome in enumerate(outcomes, start=1):
+        plan = outcome.plan
+        failed = dict(outcome.failures)
+        style = confidence_style(plan.confidence)
+
+        def cells(contact, plan=plan):
+            return (
+                str(contact["id"]),
+                full_name(contact) or "[dim]-[/dim]",
+                contact["properties"].get("email") or "[dim]-[/dim]",
+            )
+
+        table.add_row(
+            str(number),
+            f"[{style}]{plan.confidence:.0f}[/{style}]",
+            "[bold green]keep[/bold green]",
+            *cells(plan.primary),
+            f"[dim]{plan.reason}[/dim]",
+        )
+        for contact in plan.absorbed:
+            if contact["id"] in failed:
+                status = f"[bold red]failed[/bold red] [dim]{failed[contact['id']]}[/dim]"
+            elif contact["id"] in outcome.merged:
+                status = "[green]merged[/green]"
+            else:
+                status = "[yellow]would merge[/yellow]"
+            table.add_row("", "", "[dim]merge[/dim]", *cells(contact), status)
+        table.add_section()
 
     console.print(table)
 
@@ -512,14 +632,16 @@ def audit_duplicates(
     config: Path | None = CONFIG_OPTION,
     report_format: ReportFormat | None = FORMAT_OPTION,
     output: Path | None = OUTPUT_OPTION,
+    save: bool = SAVE_OPTION,
 ):
     """Detect probable duplicate contacts."""
     # Set unconditionally, never toggled off later: the console is a module global,
     # so leaving it quiet would silence the next run in the same process.
-    console.quiet = streams_to_stdout(report_format, output)
+    console.quiet = streams_to_stdout(report_format, output, save)
     settings = resolve_config(config)
     threshold = pick(threshold, settings.threshold)
-    target = resolve_report(report_format, output, settings.default_format)
+    target = resolve_report(report_format, output, settings.default_format,
+                            save=save, label='duplicates')
 
     contacts = resolve_contacts(from_file, IDENTITY_PROPERTIES)
     clusters = duplicates_with_progress(contacts, threshold)
@@ -562,13 +684,15 @@ def audit_incomplete(
     config: Path | None = CONFIG_OPTION,
     report_format: ReportFormat | None = FORMAT_OPTION,
     output: Path | None = OUTPUT_OPTION,
+    save: bool = SAVE_OPTION,
 ):
     """Flag contacts missing required fields."""
-    console.quiet = streams_to_stdout(report_format, output)
+    console.quiet = streams_to_stdout(report_format, output, save)
     settings = resolve_config(config)
     min_completeness = pick(min_completeness, settings.min_completeness)
     fields = list(required) if required else settings.required_fields
-    target = resolve_report(report_format, output, settings.default_format)
+    target = resolve_report(report_format, output, settings.default_format,
+                            save=save, label='incomplete')
 
     contacts = resolve_contacts(from_file, unique(IDENTITY_PROPERTIES, fields))
     flagged = find_incomplete(contacts, fields, min_completeness)
@@ -611,13 +735,15 @@ def audit_stale(
     config: Path | None = CONFIG_OPTION,
     report_format: ReportFormat | None = FORMAT_OPTION,
     output: Path | None = OUTPUT_OPTION,
+    save: bool = SAVE_OPTION,
 ):
     """Flag contacts with no recent activity."""
-    console.quiet = streams_to_stdout(report_format, output)
+    console.quiet = streams_to_stdout(report_format, output, save)
     settings = resolve_config(config)
     inactive_days = pick(inactive_days, settings.inactive_days)
     fields = list(activity_field) if activity_field else settings.activity_fields
-    target = resolve_report(report_format, output, settings.default_format)
+    target = resolve_report(report_format, output, settings.default_format,
+                            save=save, label='stale')
 
     contacts = resolve_contacts(from_file, unique(IDENTITY_PROPERTIES, fields))
     flagged = find_stale(contacts, inactive_days=inactive_days, activity_fields=fields)
@@ -663,9 +789,10 @@ def audit_all(
     config: Path | None = CONFIG_OPTION,
     report_format: ReportFormat | None = FORMAT_OPTION,
     output: Path | None = OUTPUT_OPTION,
+    save: bool = SAVE_OPTION,
 ):
     """Run every audit at once against a single fetch."""
-    console.quiet = streams_to_stdout(report_format, output)
+    console.quiet = streams_to_stdout(report_format, output, save)
     settings = resolve_config(config)
     threshold = pick(threshold, settings.threshold)
     min_completeness = pick(min_completeness, settings.min_completeness)
@@ -673,7 +800,9 @@ def audit_all(
     fields = list(required) if required else settings.required_fields
     activity_fields = list(activity_field) if activity_field else settings.activity_fields
     # multi=True: three audits mean three csv files, and no csv on stdout at all.
-    target = resolve_report(report_format, output, settings.default_format, multi=True)
+    target = resolve_report(report_format, output, settings.default_format, multi=True,
+                            save=save, label='audit',
+                            parts=('duplicates', 'incomplete', 'stale'))
 
     # One fetch, one union of every property the three audits read — running the
     # commands separately would page through the whole portal three times.
@@ -743,6 +872,90 @@ def audit_all(
         "stale": stale_section(stale, inactive_days, activity_fields),
     })
     if found and strict:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def merge(
+    threshold: int | None = THRESHOLD_OPTION,
+    limit: int | None = LIMIT_OPTION,
+    apply: bool = APPLY_OPTION,
+    yes: bool = YES_OPTION,
+    from_file: Path | None = FROM_FILE_OPTION,
+    config: Path | None = CONFIG_OPTION,
+    report_format: ReportFormat | None = FORMAT_OPTION,
+    output: Path | None = OUTPUT_OPTION,
+    save: bool = SAVE_OPTION,
+):
+    """Merge duplicate contacts. Previews by default; --apply writes to HubSpot.
+
+    Runs the duplicate audit fresh rather than reading a saved report, because
+    merging against a stale list is how you merge the wrong records.
+    """
+    console.quiet = streams_to_stdout(report_format, output, save)
+    settings = resolve_config(config)
+    threshold = pick(threshold, settings.threshold)
+    target = resolve_report(report_format, output, settings.default_format,
+                            save=save, label="merge")
+
+    if apply and from_file:
+        # the ids in a dump were true when it was written; the portal has moved on
+        raise fail(
+            "[bold red]Refusing to apply from a file:[/bold red] --from-file is a "
+            "snapshot, and merging on stale ids can merge the wrong records. "
+            "Drop --from-file to re-run the audit live."
+        )
+
+    contacts = resolve_contacts(from_file, MERGE_PROPERTIES)
+    clusters = duplicates_with_progress(contacts, threshold)
+    plans = plan_merges(clusters, settings.required_fields, limit=limit)
+
+    if not plans:
+        console.print(clean_panel(
+            f"[bold green]Nothing to merge[/bold green] in {len(contacts)} contacts.",
+            f"threshold {threshold}",
+        ))
+        return
+
+    total = merge_count(plans)
+    dropped = len(clusters) - len(plans)
+    if dropped:
+        console.print(
+            f"  [dim]--limit {limit}: acting on {len(plans)} of {len(clusters)} "
+            f"cluster(s), highest confidence first.[/dim]"
+        )
+
+    if not apply:
+        render_merge_plan([_preview(plan) for plan in plans], applied=False)
+        console.print(summary_panel(
+            f"[bold yellow]{total}[/bold yellow] contact(s) would be merged into "
+            f"[bold yellow]{len(plans)}[/bold yellow] survivor(s)  [dim]|[/dim]  "
+            "[bold]nothing was written[/bold]  [dim]|[/dim]  "
+            "[dim]re-run with --apply to commit[/dim]"
+        ))
+        export(target, len(contacts), {
+            "merges": merges_section([_preview(p) for p in plans], threshold, applied=False),
+        })
+        return
+
+    if not yes and not confirm_merge(total, len(plans)):
+        console.print("[dim]Cancelled. Nothing was written.[/dim]")
+        raise typer.Exit(code=1)
+
+    outcomes = merge_with_progress(plans, total)
+    render_merge_plan(outcomes, applied=True)
+
+    failures = failure_count(outcomes)
+    merged = sum(len(outcome.merged) for outcome in outcomes)
+    console.print(summary_panel(
+        f"[bold green]{merged}[/bold green] merged  [dim]|[/dim]  "
+        + (f"[bold red]{failures}[/bold red] failed  [dim]|[/dim]  " if failures else "")
+        + f"[dim]{len(plans)} survivor(s)[/dim]"
+    ))
+    export(target, len(contacts), {
+        "merges": merges_section(outcomes, threshold, applied=True),
+    })
+    if failures:
         raise typer.Exit(code=1)
 
 

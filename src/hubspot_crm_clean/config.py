@@ -42,7 +42,7 @@ class Config(NamedTuple):
     inactive_days: int
     activity_fields: list
     # ReportFormat, or None to leave --format required. There is no sensible
-    # built-in default here: unlike a threshold, guessing csv over json would be
+    # built-in default here: unlike a threshold, guessing csv over JSON would be
     # picking a data shape on the user's behalf.
     default_format: object = None
 

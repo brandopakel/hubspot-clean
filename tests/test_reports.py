@@ -16,6 +16,7 @@ from hubspot_crm_clean.reports import (
     COLUMNS,
     ReportError,
     ReportFormat,
+    auto_name,
     csv_paths,
     duplicate_rows,
     incomplete_rows,
@@ -444,3 +445,98 @@ def test_a_default_format_alone_does_not_trigger_an_export(tmp_path, dirty):
     assert result.exit_code == 0
     assert "Wrote" not in result.stdout
     assert list(tmp_path.glob("*.json")) == [dirty]
+
+
+# --------------------------------------------------------------------------
+# auto_name / --save
+# --------------------------------------------------------------------------
+
+# Naive on purpose: auto_name formats local wall-clock time into the filename,
+# so a tz-aware value here would test something the code never sees.
+FIXED = datetime(2026, 7, 27, 14, 30, 22)      # noqa: DTZ001
+
+
+def test_the_generated_name_carries_the_audit_and_the_timestamp():
+    name = auto_name("duplicates", ReportFormat.JSON, now=FIXED, exists=lambda p: False)
+    assert name.name == "hubspot-duplicates-20260727-143022.json"
+
+
+def test_the_extension_follows_the_format():
+    name = auto_name("stale", ReportFormat.CSV, now=FIXED, exists=lambda p: False)
+    assert name.suffix == ".csv"
+
+
+def test_a_second_run_in_the_same_second_does_not_clobber_the_first():
+    taken = {"hubspot-audit-20260727-143022.json"}
+    name = auto_name("audit", ReportFormat.JSON, now=FIXED, exists=lambda p: p.name in taken)
+    assert name.name == "hubspot-audit-20260727-143022-2.json"
+
+
+def test_the_counter_keeps_climbing_past_two():
+    taken = {"hubspot-audit-20260727-143022.json", "hubspot-audit-20260727-143022-2.json"}
+    name = auto_name("audit", ReportFormat.JSON, now=FIXED, exists=lambda p: p.name in taken)
+    assert name.name == "hubspot-audit-20260727-143022-3.json"
+
+
+def test_multi_csv_collides_on_the_siblings_not_the_base_name():
+    # the base name is never written for a multi-file csv export, so checking it
+    # alone would always report free and silently overwrite last run's files
+    taken = {"hubspot-audit-20260727-143022-stale.csv"}
+    name = auto_name("audit", ReportFormat.CSV, now=FIXED,
+                     parts=("duplicates", "stale"), exists=lambda p: p.name in taken)
+    assert name.name == "hubspot-audit-20260727-143022-2.csv"
+
+
+def test_save_defaults_to_json():
+    # --output has no default format on purpose; --save means "you pick everything"
+    assert resolve_target(None, None, save=True, now=FIXED).format is ReportFormat.JSON
+
+
+def test_save_respects_an_explicit_format():
+    target = resolve_target(ReportFormat.CSV, None, save=True, now=FIXED)
+    assert target.format is ReportFormat.CSV
+
+
+def test_save_respects_the_config_default():
+    target = resolve_target(None, None, default_format=ReportFormat.CSV, save=True, now=FIXED)
+    assert target.format is ReportFormat.CSV
+
+
+def test_save_never_streams_to_stdout():
+    # without the save guard, `--save --format json` looks exactly like
+    # `--format json`, which does stream - and the file would stay empty
+    assert streams_to_stdout(ReportFormat.JSON, None, save=True) is False
+    assert resolve_target(ReportFormat.JSON, None, save=True, now=FIXED).to_stdout is False
+
+
+def test_save_and_output_together_are_rejected(tmp_path):
+    with pytest.raises(ReportError, match="--save picks the filename"):
+        resolve_target(None, tmp_path / "x.json", save=True)
+
+
+def test_cli_save_writes_a_generated_file(isolated_cwd, dirty):
+    result = runner.invoke(app, ["audit", "duplicates", "--from-file", str(dirty), "--save"])
+    assert result.exit_code == 0
+    written = list(isolated_cwd.glob("hubspot-duplicates-*.json"))
+    assert len(written) == 1
+    assert json.loads(written[0].read_text(encoding="utf-8"))["duplicates"]["findings"]
+    assert "Wrote" in result.stdout
+
+
+def test_cli_save_lands_in_the_working_directory(isolated_cwd, dirty):
+    runner.invoke(app, ["audit", "all", "--from-file", str(dirty), "-s"])
+    assert list(isolated_cwd.glob("hubspot-audit-*.json"))
+
+
+def test_cli_save_with_csv_for_audit_all_writes_one_file_per_audit(isolated_cwd, dirty):
+    runner.invoke(app, ["audit", "all", "--from-file", str(dirty), "-s", "-f", "csv"])
+    for name in ("duplicates", "incomplete", "stale"):
+        assert list(isolated_cwd.glob(f"hubspot-audit-*-{name}.csv")), name
+
+
+def test_cli_save_and_output_together_are_rejected(tmp_path, dirty):
+    result = runner.invoke(app, [
+        "audit", "stale", "--from-file", str(dirty), "-s", "-o", str(tmp_path / "x.json"),
+    ])
+    assert result.exit_code == 1
+    assert "--save picks the filename" in result.stdout
